@@ -16,6 +16,7 @@ dependencies = [
     "httpx",
     "python-dotenv",
     "structlog",
+    "aiosqlite>=0.22.1",
 ]
 
 [dependency-groups]
