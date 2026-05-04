@@ -65,6 +65,16 @@ class _StrictTool(Tool[_StrictParams]):
         return ToolResult(content="strict:ok")
 
 
+class _DangerousTool(Tool[_NoopParams]):
+    name = "dangerous_noop"
+    description = "A dangerous tool for permission tests."
+    params_model = _NoopParams
+    permission = "dangerous"
+
+    async def execute(self, params: _NoopParams) -> ToolResult:
+        return ToolResult(content=f"danger:{params.value}")
+
+
 def _tool_use_response(*, input_tokens: int, output_tokens: int) -> CompletionResponse:
     return CompletionResponse(
         message=Message(
@@ -250,6 +260,62 @@ async def test_missing_tool_returns_error_tool_result_and_completes_run():
 
 
 @pytest.mark.anyio
+async def test_default_permissions_hide_dangerous_tools_from_provider_schema():
+    provider = FakeProvider(scripted_responses=[_stop_response()])
+    loop = AgentLoop(
+        provider=provider,
+        tools=ToolRegistry([_NoopTool(), _DangerousTool()]),
+    )
+
+    await loop.run("list tools")
+
+    exported_tools = provider.calls[0]["tools"]
+
+    assert exported_tools is not None
+    assert [tool.name for tool in exported_tools] == ["noop"]
+
+
+@pytest.mark.anyio
+async def test_explicit_permissions_can_expose_dangerous_tools_to_provider_schema():
+    provider = FakeProvider(scripted_responses=[_stop_response()])
+    loop = AgentLoop(
+        provider=provider,
+        tools=ToolRegistry([_NoopTool(), _DangerousTool()]),
+        allowed_permissions={"read_only", "dangerous"},
+    )
+
+    await loop.run("list tools")
+
+    exported_tools = provider.calls[0]["tools"]
+
+    assert exported_tools is not None
+    assert [tool.name for tool in exported_tools] == ["noop", "dangerous_noop"]
+
+
+@pytest.mark.anyio
+async def test_disallowed_tool_call_returns_error_tool_result():
+    provider = FakeProvider(
+        scripted_responses=[
+            _single_tool_response(tool_name="dangerous_noop", tool_input={"value": "x"}),
+            _stop_response(),
+        ]
+    )
+    loop = AgentLoop(
+        provider=provider,
+        tools=ToolRegistry([_DangerousTool()]),
+    )
+
+    result = await loop.run("try dangerous tool")
+
+    tool_message = provider.calls[1]["messages"][-1]
+
+    assert result.stop_reason == "finished"
+    assert tool_message.role == "tool"
+    assert tool_message.content[0].is_error is True
+    assert "requires permission 'dangerous'" in tool_message.content[0].content
+
+
+@pytest.mark.anyio
 async def test_invalid_tool_params_return_error_tool_result_and_completes_run():
     provider = FakeProvider(
         scripted_responses=[
@@ -307,7 +373,11 @@ async def test_day2_acceptance_can_count_python_files_with_shell_exec(tmp_path):
             _stop_response("Found 2 Python files."),
         ]
     )
-    loop = AgentLoop(provider=provider, tools=ToolRegistry([ShellExecTool()]))
+    loop = AgentLoop(
+        provider=provider,
+        tools=ToolRegistry([ShellExecTool()]),
+        allowed_permissions={"read_only", "write", "dangerous"},
+    )
 
     result = await loop.run("Count Python files in the directory")
 

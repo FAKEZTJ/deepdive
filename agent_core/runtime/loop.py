@@ -1,4 +1,3 @@
-# agent_core/runtime/loop.py
 from __future__ import annotations
 
 import asyncio
@@ -18,6 +17,7 @@ from agent_core.runtime.events import (
     ToolCallCompleted,
     ToolCallStarted,
 )
+from agent_core.tools.base import ToolPermission
 from agent_core.tools.registry import ToolRegistry
 from agent_core.types import Message, ToolResultContent, ToolUseContent, Usage
 
@@ -26,7 +26,8 @@ class Budget(BaseModel):
     max_steps: int = 20
     max_tokens: int | None = None
     timeout_seconds: float | None = None
-    max_concurrent_tools: int = 10 
+    max_concurrent_tools: int = 10
+
 
 class AgentLoop:
     """ReAct-style agent loop."""
@@ -38,11 +39,13 @@ class AgentLoop:
         tools: ToolRegistry,
         system_prompt: str | None = None,
         budget: Budget | None = None,
+        allowed_permissions: set[ToolPermission] | None = None,
     ):
         self.provider = provider
         self.tools = tools
         self.system_prompt = system_prompt
         self.budget = budget or Budget()
+        self._allowed_permissions = allowed_permissions or {"read_only", "write"}
 
     async def run(self, task: str) -> RunCompleted:
         final: RunCompleted | None = None
@@ -75,7 +78,7 @@ class AgentLoop:
             try:
                 response = await self.provider.chat(
                     messages=messages,
-                    tools=self.tools.schemas() if len(self.tools) > 0 else None,
+                    tools=self.tools.schemas(self._allowed_permissions) if len(self.tools) > 0 else None,
                     system=self.system_prompt,
                 )
             except Exception as exc:
@@ -176,6 +179,17 @@ class AgentLoop:
                 tool = self.tools.get(tu.name)
             except KeyError:
                 return self._make_failed_result(tu, step, t0, f"Tool '{tu.name}' not found")
+
+            if tool.permission not in self._allowed_permissions:
+                return self._make_failed_result(
+                    tu,
+                    step,
+                    t0,
+                    (
+                        f"Tool '{tu.name}' requires permission '{tool.permission}' "
+                        "which is not allowed in this session."
+                    ),
+                )
 
             try:
                 params = tool.parse_input(tu.input)
