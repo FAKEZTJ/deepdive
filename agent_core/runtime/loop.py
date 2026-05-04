@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 import time
 from typing import AsyncIterator
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from agent_core.providers.base import LLMProvider
+from agent_core.runtime.dispatcher import ToolDispatcher
 from agent_core.runtime.events import (
     LLMCallCompleted,
     LLMCallStarted,
@@ -19,7 +19,7 @@ from agent_core.runtime.events import (
 )
 from agent_core.tools.base import ToolPermission
 from agent_core.tools.registry import ToolRegistry
-from agent_core.types import Message, ToolResultContent, ToolUseContent, Usage
+from agent_core.types import Message, ToolUseContent, Usage
 
 
 class Budget(BaseModel):
@@ -46,6 +46,11 @@ class AgentLoop:
         self.system_prompt = system_prompt
         self.budget = budget or Budget()
         self._allowed_permissions = allowed_permissions or {"read_only", "write"}
+        self._dispatcher = ToolDispatcher(
+            registry=tools,
+            allowed_permissions=self._allowed_permissions,
+            max_concurrent=self.budget.max_concurrent_tools,
+        )
 
     async def run(self, task: str) -> RunCompleted:
         final: RunCompleted | None = None
@@ -134,19 +139,15 @@ class AgentLoop:
                 )
                 return
 
-            for tool_use in tool_uses:
-                yield ToolCallStarted(
-                    step=step,
-                    tool_call_id=tool_use.id,
-                    tool_name=tool_use.name,
-                    input=tool_use.input,
-                )
+            result_blocks = []
+            async for item in self._dispatcher.dispatch(tool_uses, step):
+                if isinstance(item, ToolCallStarted):
+                    yield item
+                    continue
 
-            tool_results = await self._execute_tools(tool_uses, step)
-            for event, _ in tool_results:
-                yield event
-
-            result_blocks = [result_block for _, result_block in tool_results]
+                completed_event, result_block = item
+                yield completed_event
+                result_blocks.append(result_block)
             messages.append(Message(role="tool", content=result_blocks))
 
             yield StepCompleted(step=step)
@@ -166,75 +167,3 @@ class AgentLoop:
             if time.monotonic() - start_time >= self.budget.timeout_seconds:
                 return "timeout"
         return None
-
-    async def _execute_tools(
-        self,
-        tool_uses: list[ToolUseContent],
-        step: int,
-    ) -> list[tuple[ToolCallCompleted, ToolResultContent]]:
-        async def one(tu: ToolUseContent) -> tuple[ToolCallCompleted, ToolResultContent]:
-            t0 = time.monotonic()
-
-            try:
-                tool = self.tools.get(tu.name)
-            except KeyError:
-                return self._make_failed_result(tu, step, t0, f"Tool '{tu.name}' not found")
-
-            if tool.permission not in self._allowed_permissions:
-                return self._make_failed_result(
-                    tu,
-                    step,
-                    t0,
-                    (
-                        f"Tool '{tu.name}' requires permission '{tool.permission}' "
-                        "which is not allowed in this session."
-                    ),
-                )
-
-            try:
-                params = tool.parse_input(tu.input)
-            except ValidationError as exc:
-                return self._make_failed_result(tu, step, t0, f"Invalid params: {exc}")
-
-            try:
-                result = await tool.execute(params)
-            except Exception as exc:
-                return self._make_failed_result(tu, step, t0, f"Tool crashed: {exc}")
-
-            duration_ms = (time.monotonic() - t0) * 1000
-            event = ToolCallCompleted(
-                step=step,
-                tool_call_id=tu.id,
-                tool_name=tu.name,
-                output=result.content,
-                is_error=result.is_error,
-                duration_ms=duration_ms,
-            )
-            block = ToolResultContent(
-                tool_use_id=tu.id,
-                content=result.content,
-                is_error=result.is_error,
-            )
-            return event, block
-
-        return await asyncio.gather(*[one(tu) for tu in tool_uses])
-
-    def _make_failed_result(
-        self,
-        tu: ToolUseContent,
-        step: int,
-        t0: float,
-        message: str,
-    ) -> tuple[ToolCallCompleted, ToolResultContent]:
-        duration_ms = (time.monotonic() - t0) * 1000
-        return (
-            ToolCallCompleted(
-                step=step,
-                tool_call_id=tu.id,
-                tool_name=tu.name,
-                output=message,
-                is_error=True,
-                duration_ms=duration_ms,
-            ),
-            ToolResultContent(tool_use_id=tu.id, content=message, is_error=True),
-        )

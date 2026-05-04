@@ -256,7 +256,7 @@ async def test_missing_tool_returns_error_tool_result_and_completes_run():
     assert result.stop_reason == "finished"
     assert tool_message.role == "tool"
     assert tool_message.content[0].is_error is True
-    assert "Tool 'missing' not found" in tool_message.content[0].content
+    assert "Tool 'missing' not registered" in tool_message.content[0].content
 
 
 @pytest.mark.anyio
@@ -332,7 +332,7 @@ async def test_invalid_tool_params_return_error_tool_result_and_completes_run():
     assert result.stop_reason == "finished"
     assert tool_message.role == "tool"
     assert tool_message.content[0].is_error is True
-    assert "Invalid params:" in tool_message.content[0].content
+    assert "Invalid arguments for tool 'strict':" in tool_message.content[0].content
 
 
 @pytest.mark.anyio
