@@ -12,6 +12,7 @@ dependencies = [
     { name = "mcp" },
     { name = "openai" },
     { name = "pydantic" },
+    { name = "python-dotenv" },
     { name = "structlog" },
 ]
 
@@ -27,6 +28,7 @@ requires-dist = [
     { name = "mcp" },
     { name = "openai", specifier = ">=1.50" },
     { name = "pydantic", specifier = ">=2.0" },
+    { name = "python-dotenv" },
     { name = "structlog" },
 ]
 

@@ -3,11 +3,14 @@ from __future__ import annotations
 import logging
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agent_core.tools.base import ToolPermission, ToolResult
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from agent_core.mcp.tool import MCPTool
 
 
 @dataclass
