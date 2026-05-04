@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar, Generic, Literal, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, Field
 
 from agent_core.types import ToolSchema
 
-TParams = TypeVar("TParams", bound=BaseModel)
+TParams = TypeVar("TParams")
 ToolPermission = Literal["read_only", "write", "dangerous"]
 
 
@@ -22,10 +22,10 @@ class ToolResult(BaseModel):
 class Tool(ABC, Generic[TParams]):
     """Base contract for all tools."""
 
-    name: ClassVar[str]
-    description: ClassVar[str]
-    params_model: ClassVar[type[BaseModel]]
-    permission: ClassVar[ToolPermission] = "read_only"
+    name: str
+    description: str
+    params_model: type[BaseModel]
+    permission: ToolPermission = "read_only"
 
     @abstractmethod
     async def execute(self, params: TParams) -> ToolResult:

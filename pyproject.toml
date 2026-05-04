@@ -12,6 +12,7 @@ dependencies = [
     "pydantic>=2.0",
     "openai>=1.50",
     "anthropic>=0.40",
+    "mcp",
     "httpx",
     "structlog",
 ]
