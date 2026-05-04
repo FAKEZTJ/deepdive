@@ -15,7 +15,10 @@ class ReadFileParams(BaseModel):
 
 class ReadFileTool(Tool[ReadFileParams]):
     name = "read_file"
-    description = "Read the contents of a text file from disk. Returns up to max_bytes bytes."
+    description = (
+        "Read the contents of a text file from disk. "
+        "Returns up to max_bytes bytes."
+    )
     params_model = ReadFileParams
     permission = "read_only"
 
@@ -39,7 +42,7 @@ class ReadFileTool(Tool[ReadFileParams]):
             truncated_note = ""
             if p.stat().st_size > params.max_bytes:
                 truncated_note = f"\n\n[truncated to {params.max_bytes} bytes]"
-            
+
             return ToolResult(
                 content=text + truncated_note,
                 metadata={"size": p.stat().st_size},

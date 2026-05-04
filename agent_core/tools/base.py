@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar, Generic, TypeVar
+from typing import Any, ClassVar, Generic, Literal, TypeVar
 from pydantic import BaseModel
 
 from agent_core.types import ToolSchema
@@ -10,6 +10,7 @@ from agent_core.types import ToolSchema
 
 # 工具参数类型，由具体 Tool 子类指定
 TParams = TypeVar("TParams", bound=BaseModel)
+ToolPermission = Literal["read_only", "write", "dangerous"]
 
 
 class ToolResult(BaseModel):
@@ -47,8 +48,8 @@ class Tool(ABC, Generic[TParams]):
     description: ClassVar[str]
     params_model: ClassVar[type[BaseModel]]
     
-    # 权限级别，Day 3 用
-    permission: ClassVar[str] = "read_only"   # "read_only" | "write" | "dangerous"
+    # 权限级别，Day 3 会在注册表和执行层真正使用
+    permission: ClassVar[ToolPermission] = "read_only"
 
     @abstractmethod
     async def execute(self, params: TParams) -> ToolResult:

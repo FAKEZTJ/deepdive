@@ -29,6 +29,7 @@
 - 统一 Provider 抽象：`LLMProvider`
 - OpenAI Provider 适配
 - Anthropic Provider 适配
+- Day 2 `AgentLoop`、预算控制与工具反馈闭环
 - 统一流式事件模型
 - 统一异常映射
 
@@ -46,6 +47,60 @@ uv sync
 
 ```powershell
 uv run pytest
+```
+
+### 3. Day 2 最小示例
+
+下面的示例展示 Day 2 的最小闭环：用户任务进入 `AgentLoop`，模型先发起 `tool_use`，工具结果再以 `role="tool"` 消息喂回模型，最后返回最终答案。
+
+```python
+from agent_core.runtime.loop import AgentLoop, Budget
+from agent_core.testing import FakeProvider
+from agent_core.tools.builtins import ReadFileTool, ShellExecTool
+from agent_core.tools.registry import ToolRegistry
+from agent_core.types import CompletionResponse, Message, ToolUseContent, Usage
+
+
+provider = FakeProvider(
+    scripted_responses=[
+        CompletionResponse(
+            message=Message(
+                role="assistant",
+                content=[
+                    ToolUseContent(
+                        id="call_1",
+                        name="shell_exec",
+                        input={"command": "rg --files .", "timeout_seconds": 5.0},
+                    )
+                ],
+            ),
+            finish_reason="tool_use",
+            usage=Usage(input_tokens=10, output_tokens=5),
+        ),
+        CompletionResponse(
+            message=Message.assistant_text("当前目录文件列表已经拿到。"),
+            finish_reason="stop",
+            usage=Usage(input_tokens=12, output_tokens=4),
+        ),
+    ]
+)
+
+loop = AgentLoop(
+    provider=provider,
+    tools=ToolRegistry([ShellExecTool(), ReadFileTool()]),
+    budget=Budget(max_steps=5, timeout_seconds=30),
+)
+
+result = await loop.run("列出当前目录文件")
+print(result.stop_reason)
+print(result.final_message.content[0].text)
+```
+
+如果你需要观察完整事件流，可以改用 `run_stream(...)`：
+
+```python
+async for event in loop.run_stream("列出当前目录文件"):
+    print(event)
 ```
 
 ## 核心概念
@@ -160,7 +215,8 @@ agent-core/
 ├── README.md
 ├── docs/
 │   └── adr/
-│       └── 001-why-custom-provider-abstraction.md
+│       ├── 001-why-custom-provider-abstraction.md
+│       └── 002-why-not-langgraph.md
 ├── agent_core/
 │   ├── __init__.py
 │   ├── types.py
@@ -195,6 +251,7 @@ agent-core/
 - OpenAI Provider 基础实现
 - Anthropic Provider 基础实现
 - OpenAI / Anthropic 的基础测试
+- Agent Loop、预算控制与工具执行闭环
 - 流式事件协议的统一
 
 ## 后续计划
@@ -213,3 +270,4 @@ agent-core/
 关于为什么要引入自定义 Provider 抽象，请参见：
 
 - [ADR-001：为什么需要自定义 Provider 抽象](./docs/adr/001-why-custom-provider-abstraction.md)
+- [ADR-002：为什么 Day 2 不使用 LangGraph](./docs/adr/002-why-not-langgraph.md)

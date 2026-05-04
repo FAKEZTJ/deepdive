@@ -10,7 +10,12 @@ from agent_core.types import ToolSchema
 class ToolRegistry:
     """工具注册表。
     
-    Day 2 只做最简的注册和查找。Day 3 加权限过滤、命名空间。
+    Day 2 只负责最小能力：
+    - 注册工具
+    - 按名称查找工具
+    - 导出传给模型的 schema
+
+    更复杂的权限过滤、命名空间和策略控制留到 Day 3。
     """
 
     def __init__(self, tools: Iterable[Tool] | None = None):

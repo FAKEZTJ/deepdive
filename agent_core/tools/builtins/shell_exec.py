@@ -7,7 +7,10 @@ from agent_core.tools.base import Tool, ToolResult
 
 class ShellExecParams(BaseModel):
     command: str = Field(..., description="Shell command to execute, e.g. 'ls -la'")
-    timeout_seconds: float = Field(default=30.0, description="Kill the process after this many seconds")
+    timeout_seconds: float = Field(
+        default=30.0,
+        description="Kill the process after this many seconds",
+    )
 
 
 class ShellExecTool(Tool[ShellExecParams]):
@@ -18,7 +21,7 @@ class ShellExecTool(Tool[ShellExecParams]):
     )
     params_model = ShellExecParams
     permission = "dangerous"
-    
+
     MAX_OUTPUT_BYTES = 50_000
 
     async def execute(self, params: ShellExecParams) -> ToolResult:
@@ -40,17 +43,17 @@ class ShellExecTool(Tool[ShellExecParams]):
                     content=f"Command timed out after {params.timeout_seconds}s",
                     is_error=True,
                 )
-            
+
             stdout_text = stdout[:self.MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
             stderr_text = stderr[:self.MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
-            
+
             output_parts = []
             if stdout_text:
                 output_parts.append(f"STDOUT:\n{stdout_text}")
             if stderr_text:
                 output_parts.append(f"STDERR:\n{stderr_text}")
             output_parts.append(f"Exit code: {proc.returncode}")
-            
+
             return ToolResult(
                 content="\n\n".join(output_parts),
                 is_error=proc.returncode != 0,

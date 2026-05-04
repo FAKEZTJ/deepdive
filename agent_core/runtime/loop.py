@@ -26,7 +26,7 @@ class Budget(BaseModel):
     max_steps: int = 20
     max_tokens: int | None = None
     timeout_seconds: float | None = None
-
+    max_concurrent_tools: int = 10 
 
 class AgentLoop:
     """ReAct-style agent loop."""
