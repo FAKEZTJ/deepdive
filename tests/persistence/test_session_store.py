@@ -27,6 +27,7 @@ async def test_create_session_and_round_trip_metadata(tmp_path):
         assert record.metadata == {"source": "test"}
         assert record.total_steps == 0
         assert record.total_usage == Usage()
+        assert record.total_cost_usd == 0.0
         assert record.stop_reason is None
         assert record.error_message is None
     finally:
@@ -102,12 +103,14 @@ async def test_update_session_state_accumulates_usage_and_status(tmp_path):
             status="paused",
             total_steps=2,
             usage_delta=Usage(input_tokens=11, output_tokens=7),
+            cost_delta_usd=0.123,
             stop_reason="max_steps",
         )
         await store.update_session_state(
             session_id,
             status="completed",
             usage_delta=Usage(input_tokens=2, output_tokens=3),
+            cost_delta_usd=0.456,
         )
 
         record = await store.get_session(session_id)
@@ -116,6 +119,7 @@ async def test_update_session_state_accumulates_usage_and_status(tmp_path):
         assert record.status == "completed"
         assert record.total_steps == 2
         assert record.total_usage == Usage(input_tokens=13, output_tokens=10)
+        assert record.total_cost_usd == pytest.approx(0.579)
         assert record.stop_reason == "max_steps"
     finally:
         await store.close()

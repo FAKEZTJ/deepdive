@@ -28,6 +28,7 @@ class SessionRecord:
     metadata: dict[str, Any]
     total_steps: int
     total_usage: Usage
+    total_cost_usd: float
     stop_reason: str | None
     error_message: str | None
 
@@ -66,10 +67,17 @@ class SessionStore:
                 total_steps INTEGER NOT NULL DEFAULT 0,
                 total_input_tokens INTEGER NOT NULL DEFAULT 0,
                 total_output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cost_usd REAL NOT NULL DEFAULT 0,
                 stop_reason TEXT,
                 error_message TEXT
             )
             """
+        )
+        await self._ensure_column(
+            conn,
+            table="sessions",
+            column="total_cost_usd",
+            ddl="ALTER TABLE sessions ADD COLUMN total_cost_usd REAL NOT NULL DEFAULT 0",
         )
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at DESC)"
@@ -162,6 +170,7 @@ class SessionStore:
         status: str | object = _UNSET,
         total_steps: int | object = _UNSET,
         usage_delta: Usage | None = None,
+        cost_delta_usd: float | None = None,
         stop_reason: str | None | object = _UNSET,
         error_message: str | None | object = _UNSET,
     ) -> None:
@@ -172,6 +181,7 @@ class SessionStore:
             status=status,
             total_steps=total_steps,
             usage_delta=usage_delta,
+            cost_delta_usd=cost_delta_usd,
             stop_reason=stop_reason,
             error_message=error_message,
         )
@@ -359,6 +369,7 @@ class SessionStore:
         status: str | object = _UNSET,
         total_steps: int | object = _UNSET,
         usage_delta: Usage | None = None,
+        cost_delta_usd: float | None = None,
         stop_reason: str | None | object = _UNSET,
         error_message: str | None | object = _UNSET,
     ) -> None:
@@ -375,6 +386,9 @@ class SessionStore:
             assignments.append("total_input_tokens = total_input_tokens + ?")
             assignments.append("total_output_tokens = total_output_tokens + ?")
             params.extend([usage_delta.input_tokens, usage_delta.output_tokens])
+        if cost_delta_usd is not None:
+            assignments.append("total_cost_usd = total_cost_usd + ?")
+            params.append(cost_delta_usd)
         if stop_reason is not _UNSET:
             assignments.append("stop_reason = ?")
             params.append(stop_reason)
@@ -403,6 +417,21 @@ class SessionStore:
                 input_tokens=row["total_input_tokens"],
                 output_tokens=row["total_output_tokens"],
             ),
+            total_cost_usd=float(row["total_cost_usd"] or 0.0),
             stop_reason=row["stop_reason"],
             error_message=row["error_message"],
         )
+
+    async def _ensure_column(
+        self,
+        conn: aiosqlite.Connection,
+        *,
+        table: str,
+        column: str,
+        ddl: str,
+    ) -> None:
+        async with conn.execute(f"PRAGMA table_info({table})") as cursor:
+            rows = await cursor.fetchall()
+        if any(row["name"] == column for row in rows):
+            return
+        await conn.execute(ddl)

@@ -72,7 +72,7 @@ def configure_logging(
     structlog.configure(
         processors=processors,
         wrapper_class=structlog.make_filtering_bound_logger(resolved_level),
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
+        logger_factory=structlog.PrintLoggerFactory(),
         cache_logger_on_first_use=True,
     )
 
@@ -106,4 +106,3 @@ class LoggingContext:
         if self._tokens is not None:
             reset_contextvars(**self._tokens)
             self._tokens = None
-

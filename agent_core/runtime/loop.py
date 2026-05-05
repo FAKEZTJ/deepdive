@@ -12,6 +12,7 @@ from agent_core.observability.logging import (
     clear_logging_context,
     get_logger,
 )
+from agent_core.observability.pricing import estimate_cost
 from agent_core.observability.tracing import SpanScope
 from agent_core.persistence.session_store import SessionStore
 from agent_core.providers.base import LLMProvider
@@ -243,14 +244,25 @@ class AgentLoop:
                                             tools=self.tools.schemas(self._allowed_permissions) if len(self.tools) > 0 else None,
                                             system=self.system_prompt,
                                         )
+                                        cost_usd = estimate_cost(
+                                            provider=self.provider.name,
+                                            model=self.provider.config.model,
+                                            input_tokens=response.usage.input_tokens,
+                                            output_tokens=response.usage.output_tokens,
+                                        )
                                         llm_span.set_attribute("llm.usage.input_tokens", response.usage.input_tokens)
                                         llm_span.set_attribute("llm.usage.output_tokens", response.usage.output_tokens)
                                         llm_span.set_attribute("llm.finish_reason", response.finish_reason)
+                                        if cost_usd is not None:
+                                            llm_span.set_attribute("llm.cost_usd", cost_usd)
+                                        else:
+                                            llm_span.set_attribute("llm.cost_known", False)
                                         logger.info(
                                             "llm.call.completed",
                                             finish_reason=response.finish_reason,
                                             input_tokens=response.usage.input_tokens,
                                             output_tokens=response.usage.output_tokens,
+                                            cost_usd=cost_usd,
                                             content_blocks=len(response.message.content),
                                         )
                             except Exception as exc:
@@ -274,6 +286,15 @@ class AgentLoop:
                                 input_tokens=total_usage.input_tokens + step_usage.input_tokens,
                                 output_tokens=total_usage.output_tokens + step_usage.output_tokens,
                             )
+                            if (
+                                cost_usd is not None
+                                and self._session_store is not None
+                                and self._session_id is not None
+                            ):
+                                await self._session_store.update_session_state(
+                                    self._session_id,
+                                    cost_delta_usd=cost_usd,
+                                )
 
                             yield await self._persist_event(
                                 LLMCallCompleted(

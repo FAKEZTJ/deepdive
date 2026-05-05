@@ -576,3 +576,41 @@ async def test_resume_stream_continues_from_checkpointed_step_and_updates_sessio
         ]
     finally:
         await store.close()
+
+
+@pytest.mark.anyio
+async def test_session_store_tracks_cost_without_double_counting_usage(tmp_path):
+    from agent_core.persistence.session_store import SessionStore
+    from agent_core.providers.base import ProviderConfig
+
+    store = SessionStore(str(tmp_path / "agent.db"))
+    await store.initialize()
+    try:
+        provider = FakeProvider(
+            scripted_responses=[
+                CompletionResponse(
+                    message=Message.assistant_text("priced reply"),
+                    finish_reason="stop",
+                    usage=Usage(input_tokens=10, output_tokens=20),
+                ),
+            ],
+            config=ProviderConfig(model="gpt-4o-mini", api_key="fake"),
+        )
+        provider.name = "openai"
+        loop = AgentLoop(
+            provider=provider,
+            tools=ToolRegistry(),
+            session_store=store,
+        )
+
+        result = await loop.run("price this")
+
+        assert result.stop_reason == "finished"
+        assert loop.session_id is not None
+
+        record = await store.get_session(loop.session_id)
+        assert record is not None
+        assert record.total_usage == Usage(input_tokens=10, output_tokens=20)
+        assert record.total_cost_usd == pytest.approx((10 * 0.15 + 20 * 0.60) / 1_000_000)
+    finally:
+        await store.close()
