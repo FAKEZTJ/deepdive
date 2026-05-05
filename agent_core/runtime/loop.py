@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import time
+import uuid
 from typing import AsyncIterator
 
 from pydantic import BaseModel
 
 from agent_core.context.manager import ContextManager
+from agent_core.observability.logging import (
+    LoggingContext,
+    clear_logging_context,
+    get_logger,
+)
 from agent_core.persistence.session_store import SessionStore
 from agent_core.providers.base import LLMProvider
 from agent_core.runtime.dispatcher import ToolDispatcher
@@ -23,6 +29,8 @@ from agent_core.runtime.events import (
 from agent_core.tools.base import ToolPermission
 from agent_core.tools.registry import ToolRegistry
 from agent_core.types import Message, ToolUseContent, Usage
+
+logger = get_logger(__name__)
 
 
 class Budget(BaseModel):
@@ -86,6 +94,7 @@ class AgentLoop:
         return final
 
     async def run_stream(self, task: str) -> AsyncIterator[RunEvent]:
+        clear_logging_context()
         initial_messages = [Message.user(task)]
         if self._session_store is not None:
             self._session_id = await self._session_store.create_session(
@@ -106,6 +115,7 @@ class AgentLoop:
         *,
         additional_input: str | None = None,
     ) -> AsyncIterator[RunEvent]:
+        clear_logging_context()
         if self._session_store is None:
             raise RuntimeError("session_store is required for resume")
 
@@ -148,155 +158,214 @@ class AgentLoop:
         start_time = time.monotonic()
         step = initial_step
 
-        while True:
-            stop_reason = self._check_budget(step, total_usage, start_time)
-            if stop_reason:
-                yield await self._persist_event(
-                    RunCompleted(
-                        final_message=messages[-1] if messages else Message.assistant_text(""),
+        with LoggingContext(session_id=self._session_id):
+            logger.info(
+                "agent.run.started",
+                initial_step=initial_step,
+                initial_message_count=len(messages),
+            )
+            while True:
+                stop_reason = self._check_budget(step, total_usage, start_time)
+                if stop_reason:
+                    logger.info(
+                        "agent.run.completed",
+                        stop_reason=stop_reason,
                         total_steps=step - 1,
-                        total_usage=total_usage,
+                        total_input_tokens=total_usage.input_tokens,
+                        total_output_tokens=total_usage.output_tokens,
+                    )
+                    yield await self._persist_event(
+                        RunCompleted(
+                            final_message=messages[-1] if messages else Message.assistant_text(""),
+                            total_steps=step - 1,
+                            total_usage=total_usage,
+                            stop_reason=stop_reason,
+                        )
+                    )
+                    await self._finish_session(
+                        status=self._status_for_stop_reason(stop_reason),
                         stop_reason=stop_reason,
                     )
-                )
-                await self._finish_session(
-                    status=self._status_for_stop_reason(stop_reason),
-                    stop_reason=stop_reason,
-                )
-                return
+                    return
 
-            yield await self._persist_event(StepStarted(step=step))
-            if self._context_manager is not None:
-                messages, compressed = await self._context_manager.compress_if_needed(
-                    messages,
-                    system_prompt=self.system_prompt,
-                )
-                if compressed:
-                    if self._session_store is not None and self._session_id is not None:
-                        await self._session_store.replace_messages(self._session_id, messages)
-                    yield await self._persist_event(
-                        ContextCompressed(step=step, new_message_count=len(messages))
+                with LoggingContext(step=step):
+                    logger.info("step.started")
+                    yield await self._persist_event(StepStarted(step=step))
+                    if self._context_manager is not None:
+                        messages, compressed = await self._context_manager.compress_if_needed(
+                            messages,
+                            system_prompt=self.system_prompt,
+                        )
+                        if compressed:
+                            logger.info(
+                                "context.compressed",
+                                new_message_count=len(messages),
+                            )
+                            if self._session_store is not None and self._session_id is not None:
+                                await self._session_store.replace_messages(self._session_id, messages)
+                            yield await self._persist_event(
+                                ContextCompressed(step=step, new_message_count=len(messages))
+                            )
+                    yield await self._persist_event(LLMCallStarted(step=step))
+
+                    llm_call_id = uuid.uuid4().hex
+                    try:
+                        with LoggingContext(llm_call_id=llm_call_id):
+                            logger.info(
+                                "llm.call.started",
+                                message_count=len(messages),
+                                tool_count=len(self.tools),
+                            )
+                            response = await self.provider.chat(
+                                messages=messages,
+                                tools=self.tools.schemas(self._allowed_permissions) if len(self.tools) > 0 else None,
+                                system=self.system_prompt,
+                            )
+                            logger.info(
+                                "llm.call.completed",
+                                finish_reason=response.finish_reason,
+                                input_tokens=response.usage.input_tokens,
+                                output_tokens=response.usage.output_tokens,
+                                content_blocks=len(response.message.content),
+                            )
+                    except Exception as exc:
+                        logger.exception("llm.call.failed")
+                        error_event = RunCompleted(
+                            final_message=Message.assistant_text(f"LLM error: {exc}"),
+                            total_steps=step - 1,
+                            total_usage=total_usage,
+                            stop_reason="error",
+                        )
+                        yield await self._persist_event(error_event)
+                        await self._finish_session(
+                            status="error",
+                            stop_reason="error",
+                            error_message=str(exc),
+                        )
+                        return
+
+                    step_usage = response.usage
+                    step_total_usage = Usage(
+                        input_tokens=total_usage.input_tokens + step_usage.input_tokens,
+                        output_tokens=total_usage.output_tokens + step_usage.output_tokens,
                     )
-            yield await self._persist_event(LLMCallStarted(step=step))
 
-            try:
-                response = await self.provider.chat(
-                    messages=messages,
-                    tools=self.tools.schemas(self._allowed_permissions) if len(self.tools) > 0 else None,
-                    system=self.system_prompt,
-                )
-            except Exception as exc:
-                error_event = RunCompleted(
-                    final_message=Message.assistant_text(f"LLM error: {exc}"),
-                    total_steps=step - 1,
-                    total_usage=total_usage,
-                    stop_reason="error",
-                )
-                yield await self._persist_event(error_event)
-                await self._finish_session(
-                    status="error",
-                    stop_reason="error",
-                    error_message=str(exc),
-                )
-                return
+                    yield await self._persist_event(
+                        LLMCallCompleted(
+                            step=step,
+                            message=response.message,
+                            usage=response.usage,
+                        )
+                    )
 
-            step_usage = response.usage
-            step_total_usage = Usage(
-                input_tokens=total_usage.input_tokens + step_usage.input_tokens,
-                output_tokens=total_usage.output_tokens + step_usage.output_tokens,
-            )
+                    pending_checkpoint_messages: list[Message] = [response.message]
+                    messages.append(response.message)
 
-            yield await self._persist_event(
-                LLMCallCompleted(
-                    step=step,
-                    message=response.message,
-                    usage=response.usage,
-                )
-            )
+                    if response.finish_reason == "stop":
+                        logger.info("step.completed", finish_reason="stop")
+                        yield await self._persist_event(StepCompleted(step=step))
+                        await self._checkpoint_step(
+                            step=step,
+                            step_usage=step_usage,
+                            new_messages=pending_checkpoint_messages,
+                        )
+                        total_usage = step_total_usage
+                        logger.info(
+                            "agent.run.completed",
+                            stop_reason="finished",
+                            total_steps=step,
+                            total_input_tokens=total_usage.input_tokens,
+                            total_output_tokens=total_usage.output_tokens,
+                        )
+                        final_event = RunCompleted(
+                            final_message=messages[-1] if messages else Message.assistant_text(""),
+                            total_steps=step,
+                            total_usage=total_usage,
+                            stop_reason="finished",
+                        )
+                        yield await self._persist_event(final_event)
+                        await self._finish_session(
+                            status="completed",
+                            stop_reason="finished",
+                        )
+                        return
 
-            pending_checkpoint_messages: list[Message] = [response.message]
-            messages.append(response.message)
+                    if response.finish_reason == "max_tokens":
+                        logger.info(
+                            "agent.run.completed",
+                            stop_reason="max_tokens",
+                            total_steps=step - 1,
+                            total_input_tokens=total_usage.input_tokens,
+                            total_output_tokens=total_usage.output_tokens,
+                        )
+                        final_event = RunCompleted(
+                            final_message=response.message,
+                            total_steps=step - 1,
+                            total_usage=total_usage,
+                            stop_reason="max_tokens",
+                        )
+                        yield await self._persist_event(final_event)
+                        await self._finish_session(
+                            status="paused",
+                            stop_reason="max_tokens",
+                        )
+                        return
 
-            if response.finish_reason == "stop":
-                yield await self._persist_event(StepCompleted(step=step))
-                await self._checkpoint_step(
-                    step=step,
-                    step_usage=step_usage,
-                    new_messages=pending_checkpoint_messages,
-                )
-                total_usage = step_total_usage
-                final_event = RunCompleted(
-                    final_message=messages[-1] if messages else Message.assistant_text(""),
-                    total_steps=step,
-                    total_usage=total_usage,
-                    stop_reason="finished",
-                )
-                yield await self._persist_event(final_event)
-                await self._finish_session(
-                    status="completed",
-                    stop_reason="finished",
-                )
-                return
+                    tool_uses = [
+                        block for block in response.message.content if isinstance(block, ToolUseContent)
+                    ]
+                    if not tool_uses:
+                        logger.info("step.completed", finish_reason=response.finish_reason)
+                        yield await self._persist_event(StepCompleted(step=step))
+                        await self._checkpoint_step(
+                            step=step,
+                            step_usage=step_usage,
+                            new_messages=pending_checkpoint_messages,
+                        )
+                        total_usage = step_total_usage
+                        logger.info(
+                            "agent.run.completed",
+                            stop_reason="finished",
+                            total_steps=step,
+                            total_input_tokens=total_usage.input_tokens,
+                            total_output_tokens=total_usage.output_tokens,
+                        )
+                        final_event = RunCompleted(
+                            final_message=response.message,
+                            total_steps=step,
+                            total_usage=total_usage,
+                            stop_reason="finished",
+                        )
+                        yield await self._persist_event(final_event)
+                        await self._finish_session(
+                            status="completed",
+                            stop_reason="finished",
+                        )
+                        return
 
-            if response.finish_reason == "max_tokens":
-                final_event = RunCompleted(
-                    final_message=response.message,
-                    total_steps=step - 1,
-                    total_usage=total_usage,
-                    stop_reason="max_tokens",
-                )
-                yield await self._persist_event(final_event)
-                await self._finish_session(
-                    status="paused",
-                    stop_reason="max_tokens",
-                )
-                return
+                    logger.info("tool.dispatch.started", tool_call_count=len(tool_uses))
+                    result_blocks = []
+                    async for item in self._dispatcher.dispatch(tool_uses, step):
+                        if isinstance(item, ToolCallStarted):
+                            yield await self._persist_event(item)
+                            continue
 
-            tool_uses = [
-                block for block in response.message.content if isinstance(block, ToolUseContent)
-            ]
-            if not tool_uses:
-                yield await self._persist_event(StepCompleted(step=step))
-                await self._checkpoint_step(
-                    step=step,
-                    step_usage=step_usage,
-                    new_messages=pending_checkpoint_messages,
-                )
-                total_usage = step_total_usage
-                final_event = RunCompleted(
-                    final_message=response.message,
-                    total_steps=step,
-                    total_usage=total_usage,
-                    stop_reason="finished",
-                )
-                yield await self._persist_event(final_event)
-                await self._finish_session(
-                    status="completed",
-                    stop_reason="finished",
-                )
-                return
+                        completed_event, result_block = item
+                        yield await self._persist_event(completed_event)
+                        result_blocks.append(result_block)
+                    tool_message = Message(role="tool", content=result_blocks)
+                    messages.append(tool_message)
+                    pending_checkpoint_messages.append(tool_message)
 
-            result_blocks = []
-            async for item in self._dispatcher.dispatch(tool_uses, step):
-                if isinstance(item, ToolCallStarted):
-                    yield await self._persist_event(item)
-                    continue
-
-                completed_event, result_block = item
-                yield await self._persist_event(completed_event)
-                result_blocks.append(result_block)
-            tool_message = Message(role="tool", content=result_blocks)
-            messages.append(tool_message)
-            pending_checkpoint_messages.append(tool_message)
-
-            yield await self._persist_event(StepCompleted(step=step))
-            await self._checkpoint_step(
-                step=step,
-                step_usage=step_usage,
-                new_messages=pending_checkpoint_messages,
-            )
-            total_usage = step_total_usage
-            step += 1
+                    logger.info("step.completed", finish_reason=response.finish_reason)
+                    yield await self._persist_event(StepCompleted(step=step))
+                    await self._checkpoint_step(
+                        step=step,
+                        step_usage=step_usage,
+                        new_messages=pending_checkpoint_messages,
+                    )
+                    total_usage = step_total_usage
+                    step += 1
 
     def _check_budget(
         self,

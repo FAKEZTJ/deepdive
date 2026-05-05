@@ -6,10 +6,13 @@ from collections.abc import AsyncIterator
 
 from pydantic import ValidationError
 
+from agent_core.observability.logging import LoggingContext, get_logger
 from agent_core.runtime.events import ToolCallCompleted, ToolCallStarted
 from agent_core.tools.base import Tool, ToolPermission
 from agent_core.tools.registry import ToolRegistry
 from agent_core.types import ToolResultContent, ToolUseContent
+
+logger = get_logger(__name__)
 
 
 class ToolDispatcher:
@@ -51,6 +54,8 @@ class ToolDispatcher:
                 serial_uses.append(tu)
 
         for tu in tool_uses:
+            with LoggingContext(step=step, tool_call_id=tu.id):
+                logger.info("tool.call.started", tool_name=tu.name)
             yield ToolCallStarted(
                 step=step,
                 tool_call_id=tu.id,
@@ -69,10 +74,13 @@ class ToolDispatcher:
             return results
 
         async def run_unknown() -> dict[str, tuple[ToolCallCompleted, ToolResultContent]]:
-            return {
-                tu.id: self._fail(tu, step, self._unknown_reason(tu))
-                for tu in unknown_uses
-            }
+            results: dict[str, tuple[ToolCallCompleted, ToolResultContent]] = {}
+            for tu in unknown_uses:
+                reason = self._unknown_reason(tu)
+                with LoggingContext(step=step, tool_call_id=tu.id):
+                    logger.warning("tool.call.rejected", tool_name=tu.name, reason=reason)
+                results[tu.id] = self._fail(tu, step, reason)
+            return results
 
         parallel_task = asyncio.create_task(run_parallel())
         serial_task = asyncio.create_task(run_serial())
@@ -94,35 +102,46 @@ class ToolDispatcher:
         step: int,
     ) -> tuple[ToolCallCompleted, ToolResultContent]:
         async with self._sem:
-            t0 = time.monotonic()
-            tool = self._registry.get(tu.name)
+            with LoggingContext(step=step, tool_call_id=tu.id):
+                t0 = time.monotonic()
+                tool = self._registry.get(tu.name)
 
-            try:
-                params = tool.parse_input(tu.input)
-            except ValidationError as exc:
-                return self._fail(tu, step, _format_validation_error(exc, tool), t0=t0)
+                try:
+                    params = tool.parse_input(tu.input)
+                except ValidationError as exc:
+                    reason = _format_validation_error(exc, tool)
+                    logger.warning("tool.call.invalid_arguments", tool_name=tu.name, reason=reason)
+                    return self._fail(tu, step, reason, t0=t0)
 
-            try:
-                result = await tool.execute(params)
-            except Exception as exc:
-                return self._fail(tu, step, f"Tool crashed: {exc}", t0=t0)
+                try:
+                    result = await tool.execute(params)
+                except Exception as exc:
+                    logger.exception("tool.call.crashed", tool_name=tu.name)
+                    return self._fail(tu, step, f"Tool crashed: {exc}", t0=t0)
 
-            duration_ms = (time.monotonic() - t0) * 1000
-            return (
-                ToolCallCompleted(
-                    step=step,
-                    tool_call_id=tu.id,
+                duration_ms = (time.monotonic() - t0) * 1000
+                logger.info(
+                    "tool.call.completed",
                     tool_name=tu.name,
-                    output=result.content,
-                    is_error=result.is_error,
                     duration_ms=duration_ms,
-                ),
-                ToolResultContent(
-                    tool_use_id=tu.id,
-                    content=result.content,
                     is_error=result.is_error,
-                ),
-            )
+                )
+                return (
+                    ToolCallCompleted(
+                        step=step,
+                        tool_call_id=tu.id,
+                        tool_name=tu.name,
+                        output=result.content,
+                        is_error=result.is_error,
+                        duration_ms=duration_ms,
+                    ),
+                    ToolResultContent(
+                        tool_use_id=tu.id,
+                        content=result.content,
+                        is_error=result.is_error,
+                    ),
+                )
+
 
     def _fail(
         self,
