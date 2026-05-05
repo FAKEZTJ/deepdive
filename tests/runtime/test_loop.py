@@ -436,3 +436,143 @@ async def test_context_manager_compresses_before_llm_call_and_emits_event():
     )
     assert third_call_messages[1].role == "assistant"
     assert third_call_messages[2].role == "tool"
+
+
+@pytest.mark.anyio
+async def test_session_store_persists_only_completed_step_messages(tmp_path):
+    from agent_core.persistence.session_store import SessionStore
+
+    store = SessionStore(str(tmp_path / "agent.db"))
+    await store.initialize()
+    try:
+        provider = FakeProvider(
+            scripted_responses=[
+                _single_tool_response(
+                    tool_name="noop",
+                    tool_input={"value": "ok"},
+                    input_tokens=3,
+                    output_tokens=2,
+                ),
+                CompletionResponse(
+                    message=Message.assistant_text("unfinished second step"),
+                    finish_reason="max_tokens",
+                    usage=Usage(input_tokens=4, output_tokens=1),
+                ),
+            ]
+        )
+        loop = AgentLoop(
+            provider=provider,
+            tools=ToolRegistry([_NoopTool()]),
+            session_store=store,
+        )
+
+        result = await loop.run("persist checkpoints only")
+
+        assert result.stop_reason == "max_tokens"
+        assert loop.session_id is not None
+
+        persisted_messages = await store.get_messages(loop.session_id)
+        assert persisted_messages == [
+            Message.user("persist checkpoints only"),
+            Message(
+                role="assistant",
+                content=[ToolUseContent(id="call_1", name="noop", input={"value": "ok"})],
+            ),
+            Message.tool_result("call_1", "tool:ok"),
+        ]
+
+        record = await store.get_session(loop.session_id)
+        assert record is not None
+        assert record.status == "paused"
+        assert record.total_steps == 1
+        assert record.total_usage == Usage(input_tokens=3, output_tokens=2)
+        assert record.stop_reason == "max_tokens"
+    finally:
+        await store.close()
+
+
+@pytest.mark.anyio
+async def test_resume_stream_continues_from_checkpointed_step_and_updates_session(tmp_path):
+    from agent_core.persistence.session_store import SessionStore
+
+    store = SessionStore(str(tmp_path / "agent.db"))
+    await store.initialize()
+    try:
+        first_provider = FakeProvider(
+            scripted_responses=[
+                _single_tool_response(
+                    tool_name="noop",
+                    tool_input={"value": "one"},
+                    input_tokens=2,
+                    output_tokens=3,
+                ),
+            ]
+        )
+        first_loop = AgentLoop(
+            provider=first_provider,
+            tools=ToolRegistry([_NoopTool()]),
+            budget=Budget(max_steps=1),
+            session_store=store,
+        )
+
+        first_events = [event async for event in first_loop.run_stream("resume me")]
+        first_final = next(event for event in first_events if isinstance(event, RunCompleted))
+        assert first_final.stop_reason == "max_steps"
+        assert first_loop.session_id is not None
+
+        second_provider = FakeProvider(
+            scripted_responses=[_stop_response("resumed done")]
+        )
+        second_loop = AgentLoop(
+            provider=second_provider,
+            tools=ToolRegistry([_NoopTool()]),
+            session_store=store,
+        )
+
+        resumed_events = [
+            event
+            async for event in second_loop.resume_stream(
+                first_loop.session_id,
+                additional_input="continue please",
+            )
+        ]
+
+        step_starts = [event.step for event in resumed_events if isinstance(event, StepStarted)]
+        final = next(event for event in resumed_events if isinstance(event, RunCompleted))
+
+        assert step_starts == [2]
+        assert final.stop_reason == "finished"
+        assert final.total_steps == 2
+        assert final.total_usage == Usage(input_tokens=3, output_tokens=4)
+
+        resumed_call_messages = second_provider.calls[0]["messages"]
+        assert resumed_call_messages == [
+            Message.user("resume me"),
+            Message(
+                role="assistant",
+                content=[ToolUseContent(id="call_1", name="noop", input={"value": "one"})],
+            ),
+            Message.tool_result("call_1", "tool:one"),
+            Message.user("continue please"),
+        ]
+
+        record = await store.get_session(first_loop.session_id)
+        assert record is not None
+        assert record.status == "completed"
+        assert record.total_steps == 2
+        assert record.total_usage == Usage(input_tokens=3, output_tokens=4)
+        assert record.stop_reason == "finished"
+
+        persisted_messages = await store.get_messages(first_loop.session_id)
+        assert persisted_messages == [
+            Message.user("resume me"),
+            Message(
+                role="assistant",
+                content=[ToolUseContent(id="call_1", name="noop", input={"value": "one"})],
+            ),
+            Message.tool_result("call_1", "tool:one"),
+            Message.user("continue please"),
+            Message.assistant_text("resumed done"),
+        ]
+    finally:
+        await store.close()
