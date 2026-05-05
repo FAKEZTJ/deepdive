@@ -23,6 +23,9 @@ class LLMCallCompleted(BaseModel):
     step: int
     message: Message
     usage: Usage
+    provider: str | None = None
+    model: str | None = None
+    cost_usd: float | None = None
 
 
 class ContextCompressed(BaseModel):

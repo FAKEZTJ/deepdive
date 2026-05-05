@@ -77,6 +77,9 @@ async def test_append_and_get_events_round_trip(tmp_path):
                 step=1,
                 message=Message.assistant_text("hi"),
                 usage=Usage(input_tokens=3, output_tokens=5),
+                provider="openai",
+                model="gpt-4o-mini",
+                cost_usd=0.00123,
             ),
             StepCompleted(step=1),
         ]

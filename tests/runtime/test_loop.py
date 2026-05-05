@@ -610,7 +610,43 @@ async def test_session_store_tracks_cost_without_double_counting_usage(tmp_path)
 
         record = await store.get_session(loop.session_id)
         assert record is not None
+        assert record.metadata == {"provider": "openai", "model": "gpt-4o-mini"}
         assert record.total_usage == Usage(input_tokens=10, output_tokens=20)
         assert record.total_cost_usd == pytest.approx((10 * 0.15 + 20 * 0.60) / 1_000_000)
+    finally:
+        await store.close()
+
+
+@pytest.mark.anyio
+async def test_llm_call_completed_event_carries_provider_model_and_cost():
+    from agent_core.persistence.session_store import SessionStore
+    from agent_core.providers.base import ProviderConfig
+
+    store = SessionStore(":memory:")
+    await store.initialize()
+    try:
+        provider = FakeProvider(
+            scripted_responses=[
+                CompletionResponse(
+                    message=Message.assistant_text("priced reply"),
+                    finish_reason="stop",
+                    usage=Usage(input_tokens=10, output_tokens=20),
+                ),
+            ],
+            config=ProviderConfig(model="gpt-4o-mini", api_key="fake"),
+        )
+        provider.name = "openai"
+        loop = AgentLoop(
+            provider=provider,
+            tools=ToolRegistry(),
+            session_store=store,
+        )
+
+        events = [event async for event in loop.run_stream("price this")]
+
+        llm_completed = next(event for event in events if event.type == "llm_call_completed")
+        assert llm_completed.provider == "openai"
+        assert llm_completed.model == "gpt-4o-mini"
+        assert llm_completed.cost_usd == pytest.approx((10 * 0.15 + 20 * 0.60) / 1_000_000)
     finally:
         await store.close()

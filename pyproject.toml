@@ -19,7 +19,12 @@ dependencies = [
     "aiosqlite>=0.22.1",
     "opentelemetry-api>=1.28.0",
     "opentelemetry-sdk>=1.28.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
 ]
+
+[project.scripts]
+agent-core = "agent_core.cli.trace:cli"
 
 [dependency-groups]
 dev = [

@@ -101,6 +101,10 @@ class AgentLoop:
         if self._session_store is not None:
             self._session_id = await self._session_store.create_session(
                 system_prompt=self.system_prompt,
+                metadata={
+                    "provider": self.provider.name,
+                    "model": self.provider.config.model,
+                },
             )
             await self._session_store.append_message(self._session_id, initial_messages[0])
 
@@ -301,6 +305,9 @@ class AgentLoop:
                                     step=step,
                                     message=response.message,
                                     usage=response.usage,
+                                    provider=self.provider.name,
+                                    model=self.provider.config.model,
+                                    cost_usd=cost_usd,
                                 )
                             )
 
