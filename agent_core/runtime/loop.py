@@ -5,9 +5,11 @@ from typing import AsyncIterator
 
 from pydantic import BaseModel
 
+from agent_core.context.manager import ContextManager
 from agent_core.providers.base import LLMProvider
 from agent_core.runtime.dispatcher import ToolDispatcher
 from agent_core.runtime.events import (
+    ContextCompressed,
     LLMCallCompleted,
     LLMCallStarted,
     RunCompleted,
@@ -40,12 +42,14 @@ class AgentLoop:
         system_prompt: str | None = None,
         budget: Budget | None = None,
         allowed_permissions: set[ToolPermission] | None = None,
+        context_manager: ContextManager | None = None,
     ):
         self.provider = provider
         self.tools = tools
         self.system_prompt = system_prompt
         self.budget = budget or Budget()
         self._allowed_permissions = allowed_permissions or {"read_only", "write"}
+        self._context_manager = context_manager
         self._dispatcher = ToolDispatcher(
             registry=tools,
             allowed_permissions=self._allowed_permissions,
@@ -78,6 +82,13 @@ class AgentLoop:
                 return
 
             yield StepStarted(step=step)
+            if self._context_manager is not None:
+                messages, compressed = await self._context_manager.compress_if_needed(
+                    messages,
+                    system_prompt=self.system_prompt,
+                )
+                if compressed:
+                    yield ContextCompressed(step=step, new_message_count=len(messages))
             yield LLMCallStarted(step=step)
 
             try:

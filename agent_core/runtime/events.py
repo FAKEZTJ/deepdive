@@ -25,6 +25,12 @@ class LLMCallCompleted(BaseModel):
     usage: Usage
 
 
+class ContextCompressed(BaseModel):
+    type: Literal["context_compressed"] = "context_compressed"
+    step: int
+    new_message_count: int
+
+
 class ToolCallStarted(BaseModel):
     type: Literal["tool_call_started"] = "tool_call_started"
     step: int
@@ -58,7 +64,7 @@ class RunCompleted(BaseModel):
 
 RunEvent = Annotated[
     Union[
-        StepStarted, LLMCallStarted, LLMCallCompleted,
+        StepStarted, ContextCompressed, LLMCallStarted, LLMCallCompleted,
         ToolCallStarted, ToolCallCompleted,
         StepCompleted, RunCompleted,
     ],

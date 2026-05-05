@@ -7,6 +7,7 @@ import pytest
 from pydantic import BaseModel
 
 from agent_core.runtime.events import (
+    ContextCompressed,
     RunCompleted,
     StepStarted,
     ToolCallCompleted,
@@ -73,6 +74,16 @@ class _DangerousTool(Tool[_NoopParams]):
 
     async def execute(self, params: _NoopParams) -> ToolResult:
         return ToolResult(content=f"danger:{params.value}")
+
+
+class _ThresholdEstimator:
+    def estimate(
+        self,
+        messages: list[Message],
+        *,
+        system_prompt: str | None = None,
+    ) -> int:
+        return 999 if len(messages) >= 5 else 0
 
 
 def _tool_use_response(*, input_tokens: int, output_tokens: int) -> CompletionResponse:
@@ -387,3 +398,41 @@ async def test_day2_acceptance_can_count_python_files_with_shell_exec(tmp_path):
     assert result.final_message.content[0].text == "Found 2 Python files."
     assert tool_message.role == "tool"
     assert "STDOUT:\n2" in tool_message.content[0].content
+
+
+@pytest.mark.anyio
+async def test_context_manager_compresses_before_llm_call_and_emits_event():
+    from agent_core.context.manager import ContextManager
+
+    summary_provider = FakeProvider(scripted_responses=[_stop_response("compressed summary")])
+    main_provider = FakeProvider(
+        scripted_responses=[
+            _single_tool_response(tool_name="noop", tool_input={"value": "one"}, input_tokens=1, output_tokens=1),
+            _single_tool_response(tool_name="noop", tool_input={"value": "two"}, input_tokens=1, output_tokens=1),
+            _stop_response("Done."),
+        ]
+    )
+    loop = AgentLoop(
+        provider=main_provider,
+        tools=ToolRegistry([_NoopTool()]),
+        context_manager=ContextManager(
+            provider=summary_provider,
+            threshold_tokens=100,
+            keep_recent_pairs=1,
+            token_estimator=_ThresholdEstimator(),
+        ),
+    )
+
+    events = [event async for event in loop.run_stream("compress later")]
+
+    compressed = [event for event in events if isinstance(event, ContextCompressed)]
+    assert [(event.step, event.new_message_count) for event in compressed] == [(3, 3)]
+
+    third_call_messages = main_provider.calls[2]["messages"]
+    assert third_call_messages[0] == Message.assistant_text(
+        "<previous_conversation_summary>\n"
+        "compressed summary\n"
+        "</previous_conversation_summary>"
+    )
+    assert third_call_messages[1].role == "assistant"
+    assert third_call_messages[2].role == "tool"
