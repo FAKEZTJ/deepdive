@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from agent_core.observability import SpanScope, configure_tracing, shutdown_tracing
 from agent_core.runtime.events import LLMCallCompleted, StepCompleted, StepStarted
 from agent_core.types import Message, Usage
 
@@ -85,8 +86,40 @@ async def test_append_and_get_events_round_trip(tmp_path):
 
         assert await store.get_events(session_id) == events
         assert await store.get_events(session_id, limit=2) == events[-2:]
+
+        records = await store.get_event_records(session_id)
+        assert [record.event for record in records] == events
+        assert all(record.trace_id is None for record in records)
     finally:
         await store.close()
+
+
+@pytest.mark.anyio
+async def test_append_event_persists_trace_envelope_columns(tmp_path):
+    from agent_core.persistence.session_store import SessionStore
+
+    configure_tracing(enabled=True, use_batch_processor=False)
+    store = SessionStore(str(tmp_path / "agent.db"))
+    await store.initialize()
+    try:
+        session_id = await store.create_session()
+        async with SpanScope("run"):
+            await store.append_event(session_id, StepStarted(step=1))
+            async with SpanScope("child"):
+                await store.append_event(session_id, StepCompleted(step=1))
+
+        records = await store.get_event_records(session_id)
+
+        assert len(records) == 2
+        assert records[0].trace_id is not None
+        assert records[0].span_id is not None
+        assert records[0].parent_span_id is None
+        assert records[1].trace_id == records[0].trace_id
+        assert records[1].span_id is not None
+        assert records[1].parent_span_id == records[0].span_id
+    finally:
+        await store.close()
+        shutdown_tracing()
 
 
 @pytest.mark.anyio

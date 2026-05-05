@@ -9,6 +9,7 @@ from typing import Any, cast
 import aiosqlite
 from pydantic import TypeAdapter
 
+from agent_core.observability.tracing import get_current_trace_envelope
 from agent_core.runtime.events import RunEvent
 from agent_core.types import ContentBlock, Message, Usage
 
@@ -31,6 +32,18 @@ class SessionRecord:
     total_cost_usd: float
     stop_reason: str | None
     error_message: str | None
+
+
+@dataclass
+class EventRecord:
+    id: int
+    session_id: str
+    seq: int
+    event: RunEvent
+    trace_id: str | None
+    span_id: str | None
+    parent_span_id: str | None
+    created_at: float
 
 
 class SessionStore:
@@ -107,6 +120,9 @@ class SessionStore:
                 seq INTEGER NOT NULL,
                 type TEXT NOT NULL,
                 step INTEGER,
+                trace_id TEXT,
+                span_id TEXT,
+                parent_span_id TEXT,
                 data_json TEXT NOT NULL,
                 created_at REAL NOT NULL,
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
@@ -114,8 +130,29 @@ class SessionStore:
             )
             """
         )
+        await self._ensure_column(
+            conn,
+            table="events",
+            column="trace_id",
+            ddl="ALTER TABLE events ADD COLUMN trace_id TEXT",
+        )
+        await self._ensure_column(
+            conn,
+            table="events",
+            column="span_id",
+            ddl="ALTER TABLE events ADD COLUMN span_id TEXT",
+        )
+        await self._ensure_column(
+            conn,
+            table="events",
+            column="parent_span_id",
+            ddl="ALTER TABLE events ADD COLUMN parent_span_id TEXT",
+        )
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_session_seq ON events(session_id, seq)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_trace_span ON events(trace_id, span_id)"
         )
 
     async def create_session(
@@ -228,22 +265,63 @@ class SessionStore:
     async def append_event(self, session_id: str, event: RunEvent) -> int:
         conn = self._require_conn()
         seq = await self._next_seq(conn, "events", session_id)
+        trace_id, span_id, parent_span_id = get_current_trace_envelope()
         await conn.execute(
             """
-            INSERT INTO events (session_id, seq, type, step, data_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO events (
+                session_id, seq, type, step, trace_id, span_id, parent_span_id, data_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
                 seq,
                 event.type,
                 getattr(event, "step", None),
+                trace_id,
+                span_id,
+                parent_span_id,
                 json.dumps(event.model_dump()),
                 time.time(),
             ),
         )
         await conn.commit()
         return seq
+
+    async def get_event_records(
+        self,
+        session_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[EventRecord]:
+        conn = self._require_conn()
+        if limit is None:
+            query = """
+                SELECT id, session_id, seq, data_json, trace_id, span_id, parent_span_id, created_at
+                FROM events
+                WHERE session_id = ?
+                ORDER BY seq
+            """
+            params: list[Any] = [session_id]
+            reverse = False
+        else:
+            query = """
+                SELECT id, session_id, seq, data_json, trace_id, span_id, parent_span_id, created_at
+                FROM events
+                WHERE session_id = ?
+                ORDER BY seq DESC
+                LIMIT ?
+            """
+            params = [session_id, limit]
+            reverse = True
+
+        async with conn.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+
+        records = [self._row_to_event_record(row) for row in rows]
+        if reverse:
+            records.reverse()
+        return records
 
     async def get_events(
         self,
@@ -420,6 +498,18 @@ class SessionStore:
             total_cost_usd=float(row["total_cost_usd"] or 0.0),
             stop_reason=row["stop_reason"],
             error_message=row["error_message"],
+        )
+
+    def _row_to_event_record(self, row: aiosqlite.Row) -> EventRecord:
+        return EventRecord(
+            id=int(row["id"]),
+            session_id=row["session_id"],
+            seq=int(row["seq"]),
+            event=cast(RunEvent, _RUN_EVENT_ADAPTER.validate_python(json.loads(row["data_json"]))),
+            trace_id=row["trace_id"],
+            span_id=row["span_id"],
+            parent_span_id=row["parent_span_id"],
+            created_at=float(row["created_at"]),
         )
 
     async def _ensure_column(
