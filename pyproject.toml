@@ -17,6 +17,8 @@ dependencies = [
     "python-dotenv",
     "structlog",
     "aiosqlite>=0.22.1",
+    "opentelemetry-api>=1.28.0",
+    "opentelemetry-sdk>=1.28.0",
 ]
 
 [dependency-groups]
