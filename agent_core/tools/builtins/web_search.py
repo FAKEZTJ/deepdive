@@ -52,10 +52,22 @@ class WebSearchTool(Tool[WebSearchParams]):
             return ToolResult(content="No results found.")
 
         formatted: list[str] = []
+        metadata_results: list[dict[str, str]] = []
         for result in results:
+            snippet = result.get("content", "")[:500]
             formatted.append(
                 f"### {result['title']}\n"
                 f"URL: {result['url']}\n"
-                f"{result.get('content', '')[:500]}"
+                f"{snippet}"
             )
-        return ToolResult(content="\n\n".join(formatted))
+            metadata_results.append(
+                {
+                    "title": result["title"],
+                    "url": result["url"],
+                    "snippet": snippet,
+                }
+            )
+        return ToolResult(
+            content="\n\n".join(formatted),
+            metadata={"query": params.query, "results": metadata_results},
+        )

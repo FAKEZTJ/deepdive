@@ -1,41 +1,64 @@
 # agent-core
 
-一个面向 Agent / LLM Runtime 的最小核心库，目标是提供统一的数据模型、Provider 适配层，以及可扩展的工具调用与流式事件抽象。
+面向 Agent / LLM 应用的 Python runtime 内核。
 
-当前实现重点放在两件事上：
+它不是“再包一层 SDK”的 demo，而是把多 Provider 适配、工具调用、上下文压缩、会话恢复、可观测性和 CLI 这些 Agent 运行时真正会遇到的问题，拆成了可演进的边界。
 
-- 统一 OpenAI 与 Anthropic 的请求/响应模型
-- 将不同厂商的流式输出归一化为一套稳定的事件协议
+## Why
 
-## 项目目标
+当一个项目从“能调模型”走向“能稳定跑 Agent”时，通常会遇到几类结构性问题：
 
-本项目希望解决多 Provider 场景下常见的几个问题：
+- 业务层被 OpenAI / Anthropic 等厂商协议直接污染，换模型成本很高。
+- 工具调用只是“模型返回的一段 JSON”，没有权限、顺序和失败语义。
+- 长任务的消息历史不断膨胀，token 成本和 context window 风险一起上升。
+- 进程一旦退出，运行中的 agent 无法恢复，也无法重放执行过程。
+- 日志、trace、成本统计和业务事件各记一套，最后谁都对不上。
 
-- 上层业务代码直接依赖厂商 SDK，切换模型供应商成本高
-- 不同厂商的消息格式、工具调用格式、流式协议差异明显
-- 工具调用、错误处理、事件消费逻辑容易散落在业务层
+`agent-core` 的目标就是把这些问题收敛成一个本地优先、Provider 中立、可恢复、可观测的 Agent runtime。
 
-因此，`agent-core` 的设计目标是：
+## Architecture
 
-- 对上提供统一接口，不暴露厂商 SDK 细节
-- 对下通过 Provider Adapter 接入不同模型厂商
-- 在运行时层面统一消息、工具调用、流式事件、异常语义
+```mermaid
+flowchart LR
+    User["User / CLI"]
+    App["App Layer\nDeepdive / custom app"]
+    Loop["AgentLoop"]
+    Ctx["ContextManager"]
+    Disp["ToolDispatcher"]
+    Reg["ToolRegistry"]
+    Prov["LLMProvider\nOpenAI / Anthropic / DeepSeek"]
+    Store["SessionStore\nSQLite + WAL"]
+    Obs["Observability\nLogs + OTel + Trace Export"]
+    MCP["MCPManager / MCPClient"]
+    Builtins["Built-in Tools\nread_file / shell_exec /\nhttp_get / web_search / write_file"]
 
-## 当前能力
+    User --> App
+    App --> Loop
+    Loop --> Ctx
+    Loop --> Prov
+    Loop --> Disp
+    Disp --> Reg
+    Reg --> Builtins
+    Reg --> MCP
+    Loop --> Store
+    Loop --> Obs
+    Disp --> Obs
+    Store --> Obs
+```
 
-当前版本已经具备以下基础能力：
+## Core Features
 
-- 统一消息模型：`Message`、`TextContent`、`ToolUseContent`、`ToolResultContent`
-- 统一 Provider 抽象：`LLMProvider`
-- OpenAI Provider 适配
-- Anthropic Provider 适配
-- Day 2 `AgentLoop`、预算控制与工具反馈闭环
-- 统一流式事件模型
-- 统一异常映射
+- Provider 中立的数据模型：统一 `Message`、`ToolUseContent`、`ToolResultContent`、`CompletionResponse`、`StreamEvent`，上层不直接依赖厂商 SDK 类型。
+- 多 Provider 适配：当前已接入 OpenAI、Anthropic、DeepSeek，并通过 `build_provider(...)` 统一构建。
+- ReAct 风格运行时：`AgentLoop` 负责 step 循环、预算控制、工具闭环、流式输出重建和 stop reason 管理。
+- 工具权限与调度：`ToolDispatcher` 将 `read_only` 工具并发执行，`write` / `dangerous` 工具串行执行，并通过白名单限制能力暴露。
+- 长任务上下文压缩：`ContextManager` 以“原子消息组 + middle summary + recent tail”策略控制 token 增长，同时保留工具调用结构。
+- 可恢复会话：`SessionStore` 基于 SQLite + WAL 持久化 `sessions / messages / events`，支持从稳定 step 边界恢复。
+- 可观测性：结构化日志、OpenTelemetry span、token / cost 统计，以及离线 trace 查看与 JSON 导出。
+- MCP 客户端接入：通过 `MCPManager` / `MCPClient` 启动外部 MCP server 并把工具注册到同一个 runtime。
+- Demo app：内置 `deepdive` 研究型 agent，展示“检索 -> 抓取 -> 写报告 -> 输出来源附录”的完整运行链路。
 
-当前版本仍然属于早期实现，重点在抽象边界和协议稳定性，而不是功能完备性。
-
-## 快速开始
+## Quick Start
 
 ### 1. 安装依赖
 
@@ -49,225 +72,94 @@ uv sync
 uv run pytest
 ```
 
-### 3. Day 2 最小示例
+### 3. 配置环境变量
 
-下面的示例展示 Day 2 的最小闭环：用户任务进入 `AgentLoop`，模型先发起 `tool_use`，工具结果再以 `role="tool"` 消息喂回模型，最后返回最终答案。
+至少配置一个 Provider 的 API Key：
 
-```python
-from agent_core.runtime.loop import AgentLoop, Budget
-from agent_core.testing import FakeProvider
-from agent_core.tools.builtins import ReadFileTool, ShellExecTool
-from agent_core.tools.registry import ToolRegistry
-from agent_core.types import CompletionResponse, Message, ToolUseContent, Usage
-
-
-provider = FakeProvider(
-    scripted_responses=[
-        CompletionResponse(
-            message=Message(
-                role="assistant",
-                content=[
-                    ToolUseContent(
-                        id="call_1",
-                        name="shell_exec",
-                        input={"command": "rg --files .", "timeout_seconds": 5.0},
-                    )
-                ],
-            ),
-            finish_reason="tool_use",
-            usage=Usage(input_tokens=10, output_tokens=5),
-        ),
-        CompletionResponse(
-            message=Message.assistant_text("当前目录文件列表已经拿到。"),
-            finish_reason="stop",
-            usage=Usage(input_tokens=12, output_tokens=4),
-        ),
-    ]
-)
-
-loop = AgentLoop(
-    provider=provider,
-    tools=ToolRegistry([ShellExecTool(), ReadFileTool()]),
-    budget=Budget(max_steps=5, timeout_seconds=30),
-)
-
-result = await loop.run("列出当前目录文件")
-print(result.stop_reason)
-print(result.final_message.content[0].text)
+```powershell
+$env:OPENAI_API_KEY="..."
+$env:ANTHROPIC_API_KEY="..."
+$env:DEEPSEEK_API_KEY="..."
 ```
 
-如果你需要观察完整事件流，可以改用 `run_stream(...)`：
+### 4. 运行一个 deepdive agent
 
-```python
-async for event in loop.run_stream("列出当前目录文件"):
-    print(event)
+```powershell
+uv run agent-core deepdive "总结 MCP 对 Agent Runtime 的价值" --provider anthropic --output-dir ./out
 ```
 
-## 核心概念
+执行后你会得到：
 
-### 1. 统一消息模型
+- `out/report.md`：最终报告
+- `agent.db`：SQLite 会话与事件库
+- 可用 `trace` / `sessions` 命令离线查看运行过程
 
-项目内部不直接使用 OpenAI 或 Anthropic 原生消息格式，而是统一使用 `agent_core.types` 中定义的消息模型。
+### 5. 查看会话和 trace
 
-主要类型包括：
-
-- `Message`
-- `TextContent`
-- `ToolUseContent`
-- `ToolResultContent`
-- `CompletionResponse`
-
-这意味着：
-
-- 上层代码只处理统一的消息结构
-- Provider 负责把统一结构转换成厂商 API 所需格式
-- 厂商响应也会被转换回统一结构
-
-### 2. Provider 抽象
-
-`LLMProvider` 是所有模型供应商的统一接口。当前约定的核心能力包括：
-
-- `chat(...)`：非流式调用
-- `chat_stream(...)`：流式调用
-
-这样做的目的是让运行时、工具执行层、上下文管理层不依赖某个特定厂商 SDK。
-
-### 3. Tool Call 转换
-
-工具调用在内部使用统一结构表达：
-
-- `ToolUseContent`：模型请求调用工具
-- `ToolResultContent`：工具执行结果回传模型
-
-不同厂商的差异由 Provider 适配层处理：
-
-- OpenAI 使用 `tool_calls` / `role="tool"` 消息
-- Anthropic 使用 `tool_use` / `tool_result` content blocks
-
-上层逻辑不需要关心这些差异。
-
-### 4. 流式事件模型
-
-不同 Provider 的流式协议差异很大，因此项目内部定义了一套统一事件：
-
-- `TextStart`
-- `TextDelta`
-- `TextEnd`
-- `ToolUseStart`
-- `ToolUseDelta`
-- `ToolUseEnd`
-- `StreamEnd`
-
-消费者只需要处理这套事件，而不需要直接解析厂商原始流。
-
-## Stream Event 的 Index 语义
-
-`StreamEvent` 在文本和工具调用事件上都带有 `index`，用于标识该事件属于哪个逻辑内容块。
-
-这一字段在不同 Provider 下的语义并不完全相同。
-
-### Anthropic
-
-Anthropic 原生流协议本身就有明确的 content block index，因此适配层会直接保留该 index。
-
-也就是说：
-
-- `index` 直接对应厂商原始 block 顺序
-- 文本块和工具块都沿用 Anthropic 的原生编号
-
-### OpenAI
-
-OpenAI Chat Completions 流式输出中，文本来自 `delta.content`，工具调用来自 `delta.tool_calls[index]`。它没有提供一套统一的“文本块 + 工具块”联合索引。
-
-因此，`OpenAIProvider` 会在适配层自行分配 `index`：
-
-- 按首次观察到的逻辑块顺序分配
-- 第一个块为 `index=0`
-- 后续每个新块依次递增
-- 文本块和工具块共享同一套编号空间
-
-例如：
-
-```text
-如果先输出文本，再输出工具：
-  text      -> index=0
-  tool #1   -> index=1
-
-如果直接输出工具，没有文本：
-  tool #1   -> index=0
+```powershell
+uv run agent-core sessions --db ./agent.db
+uv run agent-core trace <session_id> --db ./agent.db
+uv run agent-core export-trace <session_id> --db ./agent.db --output ./trace.json
 ```
 
-因此对 OpenAI 来说，`index` 是适配层定义的稳定排序键，而不是厂商原生字段。
-
-### 消费端建议
-
-建议消费端遵循以下原则：
-
-- 使用 `(事件类型族, index)` 聚合同一逻辑块
-- 不要假设 OpenAI 与 Anthropic 的 `index` 可以跨 Provider 比较
-- 如果需要工具调用的厂商原生身份，使用 `ToolUseStart.id`
-
-## 目录结构
+## 项目结构
 
 ```text
 agent-core/
-├── pyproject.toml
-├── README.md
-├── docs/
-│   └── adr/
-│       ├── 001-why-custom-provider-abstraction.md
-│       └── 002-why-not-langgraph.md
-├── agent_core/
-│   ├── __init__.py
-│   ├── types.py
-│   ├── providers/
-│   │   ├── __init__.py
-│   │   ├── base.py
-│   │   ├── openai_provider.py
-│   │   └── anthropic_provider.py
-│   ├── tools/
-│   ├── runtime/
-│   ├── context/
-│   ├── observability/
-│   └── cli/
-└── tests/
-    └── providers/
-        ├── test_openai.py
-        └── test_anthropic.py
+├─ agent_core/
+│  ├─ apps/
+│  │  └─ deepdive/
+│  ├─ cli/
+│  ├─ context/
+│  ├─ mcp/
+│  ├─ observability/
+│  ├─ persistence/
+│  ├─ providers/
+│  ├─ runtime/
+│  ├─ testing/
+│  ├─ tools/
+│  └─ types.py
+├─ docs/
+│  ├─ adr/
+│  ├─ blog/
+│  └─ resume/
+└─ tests/
 ```
 
-## 开发约定
+## 关键模块
 
-当前项目采用以下工程约定：
-
-- 内部优先使用统一类型，不直接在业务层暴露厂商 SDK 类型
-- Provider 层负责协议转换与异常映射
-- 新增 Provider 时，优先对齐已有 `chat` / `chat_stream` 行为契约
-- 流式行为必须通过测试覆盖，尤其是工具调用与结束事件顺序
-
-## 已完成内容
-
-- 统一消息与工具调用数据模型
-- OpenAI Provider 基础实现
-- Anthropic Provider 基础实现
-- OpenAI / Anthropic 的基础测试
-- Agent Loop、预算控制与工具执行闭环
-- 流式事件协议的统一
-
-## 后续计划
-
-建议后续按以下顺序推进：
-
-1. Provider 工厂或注册表
-2. Runtime 层对接统一 Provider
-3. Tool 执行器与工具注册机制
-4. Context 管理
-5. Observability
-6. CLI
+- [`agent_core/types.py`](./agent_core/types.py)：Provider 中立的数据模型和流式事件协议。
+- [`agent_core/runtime/loop.py`](./agent_core/runtime/loop.py)：运行时主循环、预算控制、session 接入和流式重建。
+- [`agent_core/runtime/dispatcher.py`](./agent_core/runtime/dispatcher.py)：工具权限控制与并发/串行调度。
+- [`agent_core/context/manager.py`](./agent_core/context/manager.py)：上下文压缩策略。
+- [`agent_core/persistence/session_store.py`](./agent_core/persistence/session_store.py)：SQLite 持久化与恢复。
+- [`agent_core/observability/`](./agent_core/observability/)：日志、OTel tracing、价格估算和 trace 导出。
+- [`agent_core/mcp/`](./agent_core/mcp/)：MCP 客户端与工具注册。
+- [`agent_core/apps/deepdive/`](./agent_core/apps/deepdive/)：研究型 agent 示例。
 
 ## ADR
 
-关于为什么要引入自定义 Provider 抽象，请参见：
+推荐先读这 5 篇：
 
 - [ADR-001：为什么需要自定义 Provider 抽象](./docs/adr/001-why-custom-provider-abstraction.md)
-- [ADR-002：为什么 Day 2 不使用 LangGraph](./docs/adr/002-why-not-langgraph.md)
+- [ADR-005：工具权限模型与并发调度](./docs/adr/005-tool-permission-model-and-concurrent-dispatch.md)
+- [ADR-007：Context 压缩策略](./docs/adr/007-context-compression-strategy.md)
+- [ADR-008：Session 持久化设计](./docs/adr/008-session-persistence-design.md)
+- [ADR-010：可观测性架构](./docs/adr/010-observability-architecture.md)
+
+完整索引见 [docs/adr/README.md](./docs/adr/README.md)。
+
+## 适合用它做什么
+
+- 做一个本地优先、可追踪、可恢复的 Agent runtime 原型。
+- 验证多 Provider 统一抽象，而不是一开始就绑定单一 SDK。
+- 把工具调用、session 恢复和 trace 展示这些“非 happy path”能力尽早做进架构。
+- 作为后续 Router、Retry、Sandbox、Planner / Executor 分层的基础内核。
+
+## 不打算解决什么
+
+- 不追求成为“大而全”的 Agent framework。
+- 不内置工作流编排 DSL。
+- 不假设必须依赖云端 trace backend 才能调试。
+
+如果你想看这套 runtime 设计背后的权衡，而不仅是 API 用法，优先读 README 里的 5 篇 ADR。

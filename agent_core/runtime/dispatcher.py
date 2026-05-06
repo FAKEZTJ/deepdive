@@ -150,6 +150,7 @@ class ToolDispatcher:
                             output=result.content,
                             is_error=result.is_error,
                             duration_ms=duration_ms,
+                            metadata=result.metadata,
                         ),
                         ToolResultContent(
                             tool_use_id=tu.id,

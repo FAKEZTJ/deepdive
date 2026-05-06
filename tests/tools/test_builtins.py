@@ -273,6 +273,8 @@ async def test_web_search_formats_results(monkeypatch):
     assert "### Result One" in result.content
     assert "URL: https://example.com/1" in result.content
     assert "Snippet two" in result.content
+    assert result.metadata["query"] == "agent loop"
+    assert result.metadata["results"][0]["url"] == "https://example.com/1"
 
 
 def test_web_search_loads_api_key_from_dotenv(monkeypatch):

@@ -50,6 +50,7 @@ class ToolCallCompleted(BaseModel):
     output: str
     is_error: bool
     duration_ms: float
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class StepCompleted(BaseModel):

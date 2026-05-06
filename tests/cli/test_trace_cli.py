@@ -5,6 +5,8 @@ import json
 
 from click.testing import CliRunner
 
+from agent_core.apps.deepdive.report import DeepdiveReport
+from agent_core.apps.deepdive.tools import SourceTracker
 from agent_core.cli.trace import cli
 from agent_core.runtime.events import LLMCallCompleted, LLMCallStarted, StepCompleted, StepStarted
 from agent_core.types import Message, Usage
@@ -82,3 +84,84 @@ def test_trace_command_json_output_exports_spans(tmp_path):
     payload = json.loads(result.output)
     assert payload["session_id"] == session_id
     assert any(span["name"] == "agent_run" for span in payload["spans"])
+
+
+def test_run_command_invokes_deepdive_and_prints_report(tmp_path, monkeypatch):
+    async def fake_deepdive_research(*args, **kwargs):
+        return DeepdiveReport(
+            topic="demo topic",
+            markdown="# Demo\n\nHello world.",
+            sources=SourceTracker(),
+            total_steps=2,
+            total_tokens=123,
+            total_cost_usd=0.0,
+            duration_seconds=1.5,
+            session_id="session-123",
+        )
+
+    monkeypatch.setattr("agent_core.cli.trace.build_provider", lambda *args, **kwargs: object())
+    monkeypatch.setattr("agent_core.cli.trace.deepdive_research", fake_deepdive_research)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "run",
+            "demo topic",
+            "--no-stream",
+            "--provider",
+            "openai",
+            "--api-key",
+            "test-key",
+            "--db",
+            str(tmp_path / "agent.db"),
+            "--output-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Hello world." in result.output
+    assert "Report saved to" in result.output
+    assert "Session: session-123" in result.output
+
+
+def test_deepdive_command_invokes_deepdive_and_prints_report(tmp_path, monkeypatch):
+    async def fake_deepdive_research(*args, **kwargs):
+        return DeepdiveReport(
+            topic="demo topic",
+            markdown="# Deepdive\n\nResearch body.",
+            sources=SourceTracker(),
+            total_steps=3,
+            total_tokens=456,
+            total_cost_usd=0.0012,
+            duration_seconds=2.5,
+            session_id="session-456",
+        )
+
+    monkeypatch.setattr("agent_core.cli.trace.build_provider", lambda *args, **kwargs: object())
+    monkeypatch.setattr("agent_core.cli.trace.deepdive_research", fake_deepdive_research)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "deepdive",
+            "demo",
+            "topic",
+            "--no-stream",
+            "--provider",
+            "anthropic",
+            "--api-key",
+            "test-key",
+            "--db",
+            str(tmp_path / "agent.db"),
+            "--output-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Research body." in result.output
+    assert "Report saved to" in result.output
+    assert "Session: session-456" in result.output

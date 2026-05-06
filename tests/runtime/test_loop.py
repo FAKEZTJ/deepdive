@@ -76,6 +76,18 @@ class _DangerousTool(Tool[_NoopParams]):
         return ToolResult(content=f"danger:{params.value}")
 
 
+class _MetadataTool(Tool[_NoopParams]):
+    name = "metadata_noop"
+    description = "Return metadata for event propagation tests."
+    params_model = _NoopParams
+
+    async def execute(self, params: _NoopParams) -> ToolResult:
+        return ToolResult(
+            content=f"meta:{params.value}",
+            metadata={"url": f"https://example.com/{params.value}"},
+        )
+
+
 class _ThresholdEstimator:
     def estimate(
         self,
@@ -238,6 +250,25 @@ async def test_tool_call_events_emit_started_and_completed_pairs():
 
 
 @pytest.mark.anyio
+async def test_tool_call_completed_event_carries_tool_metadata():
+    provider = FakeProvider(
+        scripted_responses=[
+            _single_tool_response(tool_name="metadata_noop", tool_input={"value": "ok"}),
+            _stop_response(),
+        ]
+    )
+    loop = AgentLoop(
+        provider=provider,
+        tools=ToolRegistry([_MetadataTool()]),
+    )
+
+    events = [event async for event in loop.run_stream("run metadata tool")]
+
+    completed = next(event for event in events if isinstance(event, ToolCallCompleted))
+    assert completed.metadata == {"url": "https://example.com/ok"}
+
+
+@pytest.mark.anyio
 async def test_llm_error_still_emits_run_completed():
     provider = FakeProvider(scripted_responses=[])
     loop = AgentLoop(provider=provider, tools=ToolRegistry())
@@ -248,6 +279,41 @@ async def test_llm_error_still_emits_run_completed():
 
     assert final.stop_reason == "error"
     assert "FakeProvider exhausted scripted responses" in final.final_message.content[0].text
+
+
+@pytest.mark.anyio
+async def test_stream_llm_reconstructs_message_and_continues_tool_loop():
+    streamed_events = []
+    provider = FakeProvider(
+        scripted_responses=[
+            _single_tool_response(tool_name="noop", tool_input={"value": "streamed"}),
+            _stop_response("done"),
+        ]
+    )
+    loop = AgentLoop(
+        provider=provider,
+        tools=ToolRegistry([_NoopTool()]),
+        stream_llm=True,
+        on_llm_stream_event=streamed_events.append,
+    )
+
+    result = await loop.run("stream it")
+
+    assert result.stop_reason == "finished"
+    assert len(provider.calls) == 2
+    assert [event.type for event in streamed_events] == [
+        "tool_use_start",
+        "tool_use_delta",
+        "tool_use_end",
+        "stream_end",
+        "text_start",
+        "text_delta",
+        "text_end",
+        "stream_end",
+    ]
+    tool_message = provider.calls[1]["messages"][-1]
+    assert tool_message.role == "tool"
+    assert tool_message.content[0].content == "tool:streamed"
 
 
 @pytest.mark.anyio

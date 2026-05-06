@@ -1,166 +1,194 @@
-# ADR-010: Observability Architecture
-## Status
-Accepted
+# ADR-010：可观测性架构
 
-## Context
+## 状态
 
-By Day 4, `agent-core` already had three useful primitives:
+已接受
 
-- a stable `RunEvent` protocol emitted by `AgentLoop`
-- a SQLite-backed `events` table that persisted those business events
-- resumable `sessions` / `messages` state with checkpoint semantics
+## 背景
 
-Day 5 adds production-grade observability requirements:
+到当前阶段，`agent-core` 已经具备几项可复用的基础能力：
 
-1. structured logs that can be correlated across a whole run
-2. OpenTelemetry spans for performance and topology analysis
-3. token and cost accounting for LLM calls
-4. an offline trace viewer that works without Jaeger, Tempo, or any hosted backend
+- `AgentLoop` 会产生稳定的 `RunEvent` 事件流
+- `SessionStore` 会把运行事件持久化到 SQLite
+- session 恢复与 step checkpoint 语义已经成立
 
-The core design question is whether SQLite events and OpenTelemetry traces should be treated as the same thing.
+但如果要把它当成一个真正可调试的 Agent runtime，仅有“能跑”和“能恢复”还不够，还需要回答以下问题：
 
-## Decision
+1. 如何把日志串起来  
+   一个 run 内会经历 step、LLM 调用、工具分发和工具执行，开发者需要能按同一条链路查看。
 
-We treat SQLite `events` as the source of truth for what happened, and OpenTelemetry spans as a logical view over that execution.
+2. 如何看性能与拓扑  
+   仅靠业务事件难以表达嵌套调用和耗时树，runtime 仍需要 span 级的层次结构。
 
-This ADR adopts the following rules:
+3. 如何在本地调试  
+   如果每次看 trace 都依赖 Jaeger、Tempo 或某个 hosted backend，本地开发成本会过高。
 
-1. `events` remains the canonical persisted execution log.
-2. OTel spans are generated at runtime for live observability, but are not required for local inspection.
-3. Every persisted event captures a trace envelope:
+4. token 与 cost 应该如何记录  
+   两者相关，但并不完全等价。如果把它们混成一个字段，恢复、计费和可视化都会出问题。
+
+因此，项目需要一套既支持本地优先调试、又支持标准化遥测接入的 observability 方案。
+
+## 决策
+
+我们决定采用“双通道”的可观测性设计：
+
+1. SQLite `events` 是“发生了什么”的持久化事实日志。
+2. OpenTelemetry span 是“这些事情如何嵌套、耗时如何”的运行时视图。
+3. 每条持久化事件都记录 trace envelope：
    - `trace_id`
    - `span_id`
    - `parent_span_id`
-4. CLI trace inspection and JSON export read from SQLite, not from an external OTel backend.
-5. `AgentLoop` stays minimally invasive:
-   - logging and tracing are introduced through scoped context managers
-   - core loop control flow remains event-driven
-6. token usage and cost are related but stored separately:
-   - token usage is checkpoint-aligned session state
-   - cost is estimated independently from provider/model pricing
+4. CLI 的 `sessions`、`trace`、`export-trace` 直接从 SQLite 读取，而不是依赖外部遥测后端。
+5. token usage 与 cost 分开管理：
+   - token 统计通过 session checkpoint 语义累加
+   - cost 在 `LLMCallCompleted` 时按 provider / model 定价独立估算
+6. logging、tracing 和 persistence 都围绕同一套 `RunEvent` 协议协作，而不是各自定义业务事件模型。
 
-## Rationale
+## 理由
 
-### 1. Events and traces solve different problems
+### 1. 事件与 trace 解决的是不同问题
 
-The `events` table is optimized for business execution history:
+SQLite `events` 更适合表达业务执行历史，例如：
 
-- step lifecycle
-- tool start/completion
-- LLM response payloads
-- resume/replay compatibility
+- 第几步开始
+- LLM 返回了什么
+- 调用了哪些工具
+- 工具是否失败
 
-OTel spans are optimized for hierarchical execution analysis:
+而 OTel span 更适合表达：
 
-- nested timing
-- span attributes
-- backend integrations
-- flame-graph style exploration
+- 调用树结构
+- 嵌套耗时
+- 标准化属性
+- 对接外部观测平台
 
-Merging these concerns into one abstraction would weaken both.
+这两种数据如果强行合并成一个抽象，最终两边都会被削弱。
 
-### 2. SQLite must remain sufficient for local workflows
+### 2. 本地 SQLite 必须足够完成调试闭环
 
-Requiring Jaeger or Tempo just to inspect a single local session would be an unacceptable developer experience regression.
+`agent-core` 是一个本地优先的 runtime。要求开发者为了看一次单机 trace 先起 Jaeger 或接入 hosted backend，会严重破坏体验。
 
-SQLite gives us:
+SQLite 的优势在于：
 
-- zero extra infrastructure
-- offline trace inspection
-- cross-process visibility
-- deterministic testability
+- 零额外基础设施
+- 直接可查
+- 离线可用
+- 测试中可控
 
-Therefore the local viewer and JSON exporter read directly from SQLite.
+因此，本地 trace 查看必须以 SQLite 为一等数据源。
 
-### 3. Trace envelope columns bridge runtime and persistence
+### 3. trace envelope 让“运行时 span”和“持久化事件”对齐
 
-Adding `trace_id` / `span_id` / `parent_span_id` to `events` creates a durable bridge between:
+给 `events` 表增加 `trace_id / span_id / parent_span_id` 后，项目就获得了一座桥：
 
-- runtime OTel spans
-- persisted business events
-- offline trace reconstruction
+- 运行时的 active span 可以把上下文透传到落盘事件
+- CLI 可以离线重建树形 trace
+- 后续如果导出 OTel JSON，也不需要依赖 exporter 的原始输出保留
 
-This lets us reconstruct tree structure later without depending on exporter output retention.
+这让“本地事件日志”和“标准遥测语义”之间形成了稳定映射。
 
-### 4. Structured logs should not own trace identity
+### 4. 结构化日志应该复用上下文，而不是自建 trace 源
 
-Structured logging binds business context such as:
+日志天然适合携带：
 
 - `session_id`
 - `step`
 - `llm_call_id`
 - `tool_call_id`
 
-But `trace_id` / `span_id` are derived from the current OTel span at log-render time. This avoids multiple competing trace-context sources.
+但 `trace_id` / `span_id` 最好来自当前 span 上下文，而不是日志系统再自己维护一套。否则很容易出现两套 trace identity 不一致的问题。
 
-### 5. Cost accounting must not duplicate token accounting
+### 5. token 与 cost 必须分账
 
-Session token totals are updated through checkpoint semantics. Cost accumulation is separate and occurs at LLM completion time.
+token 是 provider 返回的使用量，决定的是上下文成本和预算累积；cost 是基于 provider / model 定价表的估算值，属于派生指标。
 
-This separation avoids double-counting usage while still letting incomplete runs surface incurred spend.
+把两者拆开后：
 
-## Consequences
+- session 恢复可以只关心 token checkpoint
+- cost 可以在 run 尚未完成时逐步累积
+- 后续换定价表时不需要改动 usage 语义
 
-Positive:
+## 备选方案
 
-- local trace inspection works without any external telemetry backend
-- live OTel integration still supports production observability
-- event replay and trace reconstruction stay compatible
-- structured logs, spans, and persisted events can be correlated by shared identifiers
-- pricing can evolve independently of token accounting logic
+### 方案 A：只依赖 OTel backend，不持久化业务事件
 
-Negative:
+优点：
 
-- the system now maintains multiple observability projections over the same run
-- persistence schema is wider and migration logic is more involved
-- exporter and CLI reconstruction logic must stay aligned with the event protocol
+- 架构表面上更“标准”
+- span 查询能力更强
 
-## Implementation Notes
+缺点：
 
-The accepted Day 5 implementation has these properties:
+- 本地调试依赖外部基础设施
+- 对恢复和业务重放不友好
+- 持久化语义被 exporter 能力绑架
 
-1. `AgentLoop` creates spans for:
-   - `agent_run`
-   - `step`
-   - `llm_call`
-   - `tool_dispatch`
-2. `ToolDispatcher` creates one `tool_call` span per `ToolUseContent`, including rejected and failed calls.
-3. `LLMCallCompleted` carries provider/model/cost metadata for direct UI rendering.
-4. `sessions.total_cost_usd` tracks accumulated estimated LLM spend.
-5. `agent-core sessions` and `agent-core trace` read from SQLite.
-6. `export_session_as_otel_json()` converts SQLite records into an OTel-compatible JSON structure.
+结论：
 
-## Alternatives Considered
+不采用。
 
-### Alternative A: OTel backend as the only trace source
+### 方案 B：只保留 SQLite 事件，不接 OTel
 
-Rejected because:
+优点：
 
-- local development would require extra infrastructure
-- exporter output is not guaranteed to remain locally queryable
-- offline inspection would become much harder
+- 实现更简单
+- 本地开发体验好
 
-### Alternative B: keep only events, no OTel integration
+缺点：
 
-Rejected because:
+- 缺少标准 span 语义
+- 不利于生产环境接入外部观测平台
+- 难以做层次化性能分析
 
-- runtime hierarchy and span tooling are valuable in production
-- external observability platforms expect span semantics
-- performance analysis benefits from standard telemetry tooling
+结论：
 
-### Alternative C: derive traces only at read time, never at runtime
+不采用。
 
-Rejected because:
+### 方案 C：SQLite 事件 + OTel span 双通道
 
-- live span propagation and correlation would be unavailable
-- logs could not automatically inherit active trace context
-- production backends would not see real-time span data
+优点：
 
-## Conclusion
+- 本地调试和生产接入都兼顾
+- 业务事实与性能拓扑职责清晰
+- 能把 CLI、日志、trace 和成本统计关联起来
 
-`agent-core` adopts a dual-pipeline observability design:
+缺点：
 
-- SQLite events are the durable execution fact log
-- OpenTelemetry spans are the runtime hierarchical observability view
+- 需要维护多种观测投影
+- schema 与导出逻辑更复杂
 
-This preserves local-first developer ergonomics while still enabling production-grade telemetry integration.
+结论：
+
+采用。
+
+## 影响
+
+正面影响：
+
+- 本地无需外部 backend 也能看 session 和 trace
+- 结构化日志、span、事件和成本统计可以通过共享标识关联
+- 生产环境仍可接入标准 OTel 生态
+- 为离线导出和 trace 重建提供稳定基础
+
+负面影响：
+
+- 需要保持 CLI、SQLite schema 和运行时 span 语义一致
+- 可观测性代码不再只是“打一行日志”的级别
+- 系统维护的是多种视图，而不是单一日志输出
+
+## 实现约束
+
+当前实现遵守以下约束：
+
+1. `AgentLoop` 为 `agent_run`、`step`、`llm_call`、`tool_dispatch` 创建 span。
+2. `ToolDispatcher` 为每次工具执行创建 `tool_call` span，包括失败和拒绝场景。
+3. 每条落盘事件都携带 trace envelope。
+4. `LLMCallCompleted` 事件直接携带 provider、model、usage、cost 元数据。
+5. `sessions.total_cost_usd` 记录累计估算成本。
+6. `agent-core trace` 与 `agent-core export-trace` 直接读取 SQLite，而不是读取外部 exporter 的产物。
+
+## 结论
+
+`agent-core` 接受“SQLite 事件作为持久化事实日志，OpenTelemetry span 作为运行时层次视图”的双通道可观测性设计。
+
+这项决策的核心价值是：既保住本地优先的开发体验，也不给后续生产级观测能力设上限。

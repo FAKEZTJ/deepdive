@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import AsyncIterator
+import inspect
+from typing import AsyncIterator, Awaitable, Callable, cast
 
 from pydantic import BaseModel
 
@@ -28,9 +29,10 @@ from agent_core.runtime.events import (
     ToolCallCompleted,
     ToolCallStarted,
 )
+from agent_core.runtime.reconstruct import StreamReconstructor
 from agent_core.tools.base import ToolPermission
 from agent_core.tools.registry import ToolRegistry
-from agent_core.types import Message, ToolUseContent, Usage
+from agent_core.types import CompletionResponse, Message, StreamEvent, ToolUseContent, Usage
 
 logger = get_logger(__name__)
 
@@ -55,6 +57,8 @@ class AgentLoop:
         allowed_permissions: set[ToolPermission] | None = None,
         context_manager: ContextManager | None = None,
         session_store: SessionStore | None = None,
+        stream_llm: bool = False,
+        on_llm_stream_event: Callable[[StreamEvent], Awaitable[None] | None] | None = None,
     ):
         self.provider = provider
         self.tools = tools
@@ -63,6 +67,8 @@ class AgentLoop:
         self._allowed_permissions = allowed_permissions or {"read_only", "write"}
         self._context_manager = context_manager
         self._session_store = session_store
+        self._stream_llm = stream_llm
+        self._on_llm_stream_event = on_llm_stream_event
         self._session_id: str | None = None
         self._dispatcher = ToolDispatcher(
             registry=tools,
@@ -243,11 +249,7 @@ class AgentLoop:
                                             message_count=len(messages),
                                             tool_count=len(self.tools),
                                         )
-                                        response = await self.provider.chat(
-                                            messages=messages,
-                                            tools=self.tools.schemas(self._allowed_permissions) if len(self.tools) > 0 else None,
-                                            system=self.system_prompt,
-                                        )
+                                        response = await self._call_provider(messages)
                                         cost_usd = estimate_cost(
                                             provider=self.provider.name,
                                             model=self.provider.config.model,
@@ -484,3 +486,49 @@ class AgentLoop:
         if stop_reason == "error":
             return "error"
         return "paused"
+
+    async def _call_provider(self, messages: list[Message]) -> CompletionResponse:
+        tools = self.tools.schemas(self._allowed_permissions) if len(self.tools) > 0 else None
+        if not self._stream_llm:
+            return await self.provider.chat(
+                messages=messages,
+                tools=tools,
+                system=self.system_prompt,
+            )
+        return await self._call_provider_streaming(messages, tools)
+
+    async def _call_provider_streaming(
+        self,
+        messages: list[Message],
+        tools: list | None,
+    ) -> CompletionResponse:
+        reconstructor = StreamReconstructor()
+        finish_reason: str | None = None
+        usage = Usage()
+
+        async for stream_event in self.provider.chat_stream(
+            messages=messages,
+            tools=tools,
+            system=self.system_prompt,
+        ):
+            reconstructor.feed(stream_event)
+            await self._emit_stream_event(stream_event)
+            if stream_event.type == "stream_end":
+                finish_reason = stream_event.finish_reason
+                usage = stream_event.usage
+
+        if finish_reason is None:
+            raise RuntimeError(f"{self.provider.name} chat_stream ended without stream_end")
+
+        return CompletionResponse(
+            message=reconstructor.build_message(),
+            finish_reason=finish_reason,
+            usage=usage,
+        )
+
+    async def _emit_stream_event(self, event: StreamEvent) -> None:
+        if self._on_llm_stream_event is None:
+            return
+        result = self._on_llm_stream_event(event)
+        if inspect.isawaitable(result):
+            await cast(Awaitable[None], result)
